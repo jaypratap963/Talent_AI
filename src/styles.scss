@@ -1,0 +1,114 @@
+// ─────────────────────────────────────────────
+// styles.scss — Global design system
+// Dark theme with electric blue accent.
+// Fonts: Syne (display) + DM Sans (body)
+// ─────────────────────────────────────────────
+
+// ── CSS Variables (Design Tokens) ─────────────
+:root {
+  // Background layers
+  --bg:             #0a0a0f;
+  --surface:        #111118;
+  --surface-raised: #1a1a24;
+
+  // Borders
+  --border:         #2a2a38;
+
+  // Text hierarchy
+  --text-primary:   #f0f0f8;
+  --text-secondary: #b8b8cc;
+  --text-muted:     #6a6a88;
+
+  // Brand accent — electric cyan-blue
+  --accent:         #63b3ed;
+  --accent-dim:     rgba(99, 179, 237, 0.15);
+
+  // Semantic colors
+  --success:        #48bb78;
+  --warning:        #f6ad55;
+  --danger:         #fc8181;
+}
+
+// ── Reset & Base ───────────────────────────────
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-secondary);
+  font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  // Subtle noise texture overlay
+  &::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 9999;
+    opacity: 0.4;
+  }
+}
+
+app-root {
+  display: block;
+  height: 100%;
+  width: 100%;
+}
+
+// ── Typography ────────────────────────────────
+h1, h2, h3, h4, h5 {
+  font-family: 'Syne', sans-serif;
+  color: var(--text-primary);
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+
+  &:hover { text-decoration: underline; }
+}
+
+// ── Scrollbar ──────────────────────────────────
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+
+  &:hover { background: var(--text-muted); }
+}
+
+// ── Focus Visible ─────────────────────────────
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+// ── Utility Classes ───────────────────────────
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  white-space: nowrap;
+  border-width: 0;
+}

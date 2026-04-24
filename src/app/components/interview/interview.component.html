@@ -1,0 +1,303 @@
+<!-- interview.component.html — Avatar-based interview, no chat UI shown -->
+<div class="interview-screen">
+
+  <!-- Hidden chat window (maintains history internally) -->
+  <app-chat-window [messages]="messages()" />
+
+  <!-- ── Top Bar ─────────────────────────────── -->
+  <header class="top-bar">
+    <div class="brand">
+      <span class="brand-mark">◈</span>
+      <span class="brand-name">TalentAI</span>
+    </div>
+
+    <div class="top-center">
+      @if (isActive()) {
+        <div class="progress-track">
+          @for (i of [1,2,3,4,5,6,7,8]; track i) {
+            <div class="progress-dot" [class.filled]="questionNum() >= i"></div>
+          }
+        </div>
+      }
+    </div>
+
+    <div class="top-actions">
+      @if (isActive()) {
+        <button class="ghost-btn" (click)="endEarly()">End Session</button>
+      }
+      @if (isCompleted() && evaluation()) {
+        <button class="pill-btn accent" (click)="viewEvaluation()">📊 Results</button>
+      }
+      <button class="icon-btn" (click)="restartInterview()" title="Restart">↺</button>
+    </div>
+  </header>
+
+  <!-- ── Main Stage ─────────────────────────── -->
+  <main class="stage">
+
+    <!-- ── PRE-START ──────────────────────────── -->
+    @if (!isStarted()) {
+      <div class="intro-view" @fadeSlide>
+        <div class="avatar-wrap idle">
+          <div class="avatar-rings">
+            <div class="ring r1"></div>
+            <div class="ring r2"></div>
+            <div class="ring r3"></div>
+          </div>
+          <div class="avatar-core">
+            <span class="avatar-letter">A</span>
+          </div>
+        </div>
+
+        <div class="intro-text">
+          <h1>Meet Alex</h1>
+          <p>Your AI interviewer. Alex will ask questions based on your resume,
+            evaluate your answers in real-time, and adapt to your responses.</p>
+        </div>
+
+        <div class="feature-row">
+          <div class="feature-chip">🎙️ Voice-first</div>
+          <div class="feature-chip">🧠 Adaptive AI</div>
+          <div class="feature-chip">📊 Scored feedback</div>
+        </div>
+
+        @if (!speech.sttSupported) {
+          <div class="browser-warn">
+            ⚠️ Voice input requires Chrome or Edge. You can still type your answers.
+          </div>
+        }
+
+        <button class="cta-btn" (click)="startInterview()">
+          <span>Begin Interview</span>
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M3.75 9H14.25M14.25 9L9.75 4.5M14.25 9L9.75 13.5"
+              stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+    }
+
+    <!-- ── ACTIVE / COMPLETED INTERVIEW ──────── -->
+    @if (isStarted()) {
+      <div class="interview-view">
+
+        <!-- ── Avatar ──────────────────────────── -->
+        <div class="avatar-scene">
+          <div class="avatar-wrap" [class]="avatarState()">
+            <!-- Pulse rings — animated differently per state -->
+            <div class="avatar-rings">
+              <div class="ring r1"></div>
+              <div class="ring r2"></div>
+              <div class="ring r3"></div>
+            </div>
+            <!-- Voice waveform bars (shown when AI speaking or user speaking) -->
+            <div class="waveform" [class.active]="avatarState() === 'speaking' || avatarState() === 'listening'">
+              @for (b of [1,2,3,4,5,6,7]; track b) {
+                <div class="wave-bar" [style.animation-delay.ms]="b * 80"></div>
+              }
+            </div>
+            <div class="avatar-core">
+              <span class="avatar-letter">A</span>
+            </div>
+          </div>
+
+          <!-- Status label under avatar -->
+          <div class="avatar-status" [class.visible]="!!statusLabel()">
+            @if (avatarState() === 'thinking' || avatarState() === 'processing') {
+              <div class="thinking-dots">
+                <span></span><span></span><span></span>
+              </div>
+            }
+            <span>{{ statusLabel() }}</span>
+          </div>
+        </div>
+
+        <!-- ── Current question card ──────────── -->
+        <div class="question-card" [class.visible]="!!currentQ() && !isTyping()">
+          <div class="question-label">Question {{ questionNum() }} of 8</div>
+          <p class="question-text">{{ currentQ() }}</p>
+          @if (isSpeaking()) {
+            <button class="mute-btn" (click)="stopSpeaking()">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path d="M11 5L6 9H2v6h4l5 4V5z" fill="currentColor"/>
+                <line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+              Mute Alex
+            </button>
+          }
+        </div>
+
+        <!-- ── Completed state ────────────────── -->
+        @if (isCompleted()) {
+          <div class="done-card">
+            <div class="done-icon">✓</div>
+            <h3>Interview Complete</h3>
+            <p>Thank you for your time. Your evaluation is ready.</p>
+            @if (evaluation()) {
+              <button class="cta-btn" (click)="viewEvaluation()">
+                View Your Results →
+              </button>
+            } @else {
+              <div class="gen-loader">
+                <div class="thinking-dots"><span></span><span></span><span></span></div>
+                <span>Generating evaluation...</span>
+              </div>
+            }
+          </div>
+        }
+
+        <!-- ── User response area (active only) ── -->
+        @if (isActive()) {
+          <div class="response-area">
+
+            <!-- Live transcript pill (shows what mic is hearing) -->
+            @if (isListening() && liveText()) {
+              <div class="live-pill">
+                <span class="live-dot"></span>
+                <em>{{ liveText() }}</em>
+              </div>
+            }
+
+            <!-- Filler patience indicator -->
+            @if (phase() === 'filler-pause') {
+              <div class="patience-hint">
+                Take your time — I'm still listening...
+              </div>
+            }
+
+            <!-- Primary voice controls -->
+            <div class="voice-controls">
+              @if (speech.sttSupported) {
+                <button
+                  class="mic-btn"
+                  [class.active]="isListening()"
+                  [class.processing]="phase() === 'processing'"
+                  [disabled]="isTyping() || isLoading() || isSpeaking()"
+                  (click)="toggleListening()"
+                  [attr.aria-label]="isListening() ? 'Stop speaking' : 'Start speaking'"
+                >
+                  <div class="mic-icon">
+                    @if (isListening()) {
+                      <!-- Animated mic when listening -->
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                        <rect x="9" y="2" width="6" height="12" rx="3" fill="currentColor"/>
+                        <path d="M5 10a7 7 0 0 0 14 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="12" y1="19" x2="12" y2="23" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="8" y1="23" x2="16" y2="23" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                      </svg>
+                    } @else {
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                        <rect x="9" y="2" width="6" height="12" rx="3" stroke="currentColor" stroke-width="2" fill="none"/>
+                        <path d="M5 10a7 7 0 0 0 14 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="12" y1="19" x2="12" y2="23" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="8" y1="23" x2="16" y2="23" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                      </svg>
+                    }
+                  </div>
+                  <span>{{ isListening() ? 'Listening...' : 'Tap to Speak' }}</span>
+                </button>
+              }
+
+              <!-- Text fallback toggle -->
+              <button class="text-toggle" (click)="toggleTextInput()" title="Type instead">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"
+                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                {{ showTextInput() ? 'Hide keyboard' : 'Type answer' }}
+              </button>
+            </div>
+
+            <!-- Text input (collapsible fallback) -->
+            @if (showTextInput()) {
+              <div class="text-input-box">
+                <textarea
+                  class="answer-textarea"
+                  [value]="textInput()"
+                  (input)="textInput.set($any($event.target).value)"
+                  (keydown)="onKeyDown($event)"
+                  placeholder="Type your answer here..."
+                  rows="3"
+                  [disabled]="isTyping() || isLoading()"
+                  autofocus
+                ></textarea>
+                <button
+                  class="send-btn"
+                  [disabled]="!textInput().trim() || isTyping() || isLoading()"
+                  (click)="submitAnswer()"
+                >Send ↑</button>
+              </div>
+            }
+
+          </div>
+        }
+
+      </div>
+    }
+
+  </main>
+
+  <!-- ── Evaluation Modal ───────────────────── -->
+  @if (showEvaluation() && evaluation()) {
+    <div class="modal-overlay" (click)="hideEvaluation()">
+      <div class="eval-modal" (click)="$event.stopPropagation()">
+
+        <div class="eval-header">
+          <h2>Your Interview Results</h2>
+          <button class="close-x" (click)="hideEvaluation()">✕</button>
+        </div>
+
+        <div class="overall-score" [class]="getScoreClass(evaluation()!.overallScore)">
+          <div class="score-circle">
+            <span class="score-num">{{ evaluation()!.overallScore }}</span>
+            <span class="score-of">/100</span>
+          </div>
+          <span class="score-tag">{{ getScoreLabel(evaluation()!.overallScore) }}</span>
+        </div>
+
+        <div class="sub-scores">
+          @for (item of [
+            {label: 'Technical', val: evaluation()!.technicalScore},
+            {label: 'Communication', val: evaluation()!.communicationScore},
+            {label: 'Confidence', val: evaluation()!.confidenceScore}
+          ]; track item.label) {
+            <div class="sub-row">
+              <span class="sub-label">{{ item.label }}</span>
+              <div class="bar-track">
+                <div class="bar-fill" [class]="getScoreClass(item.val)" [style.width.%]="item.val"></div>
+              </div>
+              <span class="sub-val">{{ item.val }}</span>
+            </div>
+          }
+        </div>
+
+        <div class="feedback-cols">
+          <div class="feedback-col">
+            <h4>✅ Strengths</h4>
+            <ul>
+              @for (s of evaluation()!.strengths; track s) { <li>{{ s }}</li> }
+            </ul>
+          </div>
+          <div class="feedback-col">
+            <h4>📈 Improve On</h4>
+            <ul>
+              @for (i of evaluation()!.improvements; track i) { <li>{{ i }}</li> }
+            </ul>
+          </div>
+        </div>
+
+        <div class="summary-box">
+          <h4>Alex's Summary</h4>
+          <p>{{ evaluation()!.summary }}</p>
+        </div>
+
+        <button class="cta-btn full" (click)="restartInterview()">
+          Start New Interview
+        </button>
+
+      </div>
+    </div>
+  }
+
+</div>
