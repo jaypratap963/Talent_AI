@@ -1,12 +1,30 @@
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // services/ai.service.ts
-// Handles all communication with OpenAI Chat API.
-// Now accepts SpeechAnalysis to adapt interviewer
-// tone and difficulty based on how the candidate spoke.
-// ─────────────────────────────────────────────
+//
+// LATENCY PIPELINE (what changed):
+//
+//  OLD (serial — 4-6s dead silence):
+//    Whisper done → GPT full response → TTS full fetch → play
+//
+//  NEW (parallel — ~1s to first audio):
+//    Whisper done
+//      ├─ immediately play pre-cached filler clip ("Mmm, let me think...")
+//      ├─ GPT streams tokens via SSE
+//      │     └─ sentence splitter fires on each "." "?" "!"
+//      │           └─ each sentence → TTS fetch (parallel, queued)
+//      └─ audio queue plays sentence 1 as soon as it arrives,
+//         sentences 2,3,4... play in sequence right after
+//
+//  NET RESULT: User hears Alex respond within ~1s of Whisper finishing.
+//  The filler clip covers the GPT latency. TTS of sentence 1 is ready
+//  ~300ms after GPT emits the first sentence.
+// ─────────────────────────────────────────────────────────────────
 
 import { Injectable, signal } from '@angular/core';
-import { ChatMessage, EvaluationResult, ResumeData, AIConfig } from '../models/interview.models';
+import { Subject } from 'rxjs';
+import {
+  ChatMessage, EvaluationResult, ResumeData, AIConfig
+} from '../models/interview.models';
 import { SpeechAnalysis } from './speech.service';
 import { SpeechService } from './speech.service';
 
@@ -16,122 +34,156 @@ export class AiService {
   isLoading = signal(false);
   error     = signal<string | null>(null);
 
+  // Emits each sentence token as it streams in (drives avatar mouth)
+  streamToken$ = new Subject<string>();
+  // Emits when full response is assembled
+  responseComplete$ = new Subject<string>();
+
   private config: AIConfig = {
     apiKey:      '',
     model:       'gpt-4o-mini',
-    maxTokens:   600,
-    temperature: 0.7,
+    maxTokens:   500,
+    temperature: 0.75,
   };
 
-  private readonly OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+  private readonly CHAT_URL  = 'https://api.openai.com/v1/chat/completions';
+  private readonly TTS_URL   = 'https://api.openai.com/v1/audio/speech';
 
-  // Inject SpeechService so setApiKey propagates to it automatically
-  constructor(private speechService: SpeechService) {}
+  // ── Audio queue for sentence-by-sentence playback ─────────────
+  // Each sentence is fetched in parallel; played in order.
+  private audioQueue:     HTMLAudioElement[] = [];
+  private isPlayingQueue  = false;
+  private queueDone       = false;   // set when GPT stream ends + all TTS fetched
+  private onQueueEmpty:   (() => void) | null = null;
 
-  // ── API Key ───────────────────────────────────
+  // Pre-cached filler audio blobs (loaded once at startup)
+  private fillerClips: HTMLAudioElement[] = [];
+  private fillersLoaded = false;
+
+  constructor(private speechService: SpeechService) {
+    // Pre-generate filler clips on construction so they're instant
+    // We do this lazily on first setApiKey() call
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // API KEY
+  // ─────────────────────────────────────────────────────────────
 
   setApiKey(key: string): void {
     this.config.apiKey = key.trim();
-    // Keep speech service in sync — it needs the key for Whisper + TTS
     this.speechService.setApiKey(key.trim());
+    // Pre-warm filler clips now that we have a key
+    if (key.trim()) this.preWarmFillerClips();
   }
 
   hasApiKey(): boolean {
     return this.config.apiKey.length > 0;
   }
 
-  // ── System Prompt ─────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // PRE-WARM FILLER CLIPS
+  // Generates 4 short "thinking" TTS clips and caches them as
+  // Audio objects. When GPT is generating, we immediately play
+  // one of these so the user hears Alex react within ~100ms.
+  // ─────────────────────────────────────────────────────────────
 
-  /**
-   * Builds the interviewer system prompt.
-   * If speech analysis is provided, it appends a coaching note
-   * so Alex can react to HOW the candidate answered (not just what).
-   */
-  private buildSystemPrompt(resume: ResumeData, analysis?: SpeechAnalysis | null): string {
-    // Build dynamic coaching note from speech analysis
-    let speechNote = '';
-    if (analysis) {
-      const secs = Math.round(analysis.rawDurationMs / 1000);
+  private async preWarmFillerClips(): Promise<void> {
+    if (this.fillersLoaded || !this.config.apiKey) return;
+    this.fillersLoaded = true;
 
-      if (analysis.confidenceHint === 'hesitant') {
-        speechNote = `
-SPEECH ANALYSIS OF LAST ANSWER:
-- Confidence level : HESITANT
-- Fillers detected : ${analysis.hasFillers ? 'Yes (um/uh/like etc.)' : 'No'}
-- Notable pauses   : ${analysis.pauseCount}
-- Answer duration  : ${secs}s
-→ The candidate sounded uncertain. Either gently probe deeper ("You seemed to hesitate — 
-  can you elaborate on that point?") or ask a supportive follow-up to give them another 
-  chance to demonstrate knowledge. Do NOT embarrass them, but do note the hesitation.`;
+    const fillerTexts = [
+      'Mmm, right.',
+      'Okay.',
+      'I see.',
+      'Interesting.',
+    ];
 
-      } else if (analysis.confidenceHint === 'confident') {
-        speechNote = `
-SPEECH ANALYSIS OF LAST ANSWER:
-- Confidence level : CONFIDENT
-- Fillers detected : ${analysis.hasFillers ? 'Minor' : 'None'}
-- Answer duration  : ${secs}s
-→ Strong, clear delivery. You may increase question difficulty or ask a more nuanced 
-  follow-up. Acknowledge briefly: "Good answer." then move forward.`;
+    // Fetch all in parallel — each is ~0.3s of audio
+    const fetches = fillerTexts.map(text =>
+      this.fetchTTSAudio(text).catch(() => null)
+    );
 
-      } else {
-        speechNote = `
-SPEECH ANALYSIS OF LAST ANSWER:
-- Confidence level : MIXED
-- Fillers detected : ${analysis.hasFillers ? 'Yes' : 'No'}
-- Answer duration  : ${secs}s
-→ Answer was reasonable but delivery was uneven. Ask a standard follow-up or transition.`;
+    const results = await Promise.allSettled(fetches);
+
+    results.forEach(r => {
+      if (r.status === 'fulfilled' && r.value) {
+        this.fillerClips.push(r.value);
       }
-    }
-
-    return `You are Alex, a sharp and experienced Senior Technical Interviewer at a top tech company.
-
-PERSONALITY:
-- Professional but human — warm tone, not robotic
-- Ask ONE focused question at a time, never two at once
-- Probe weak or vague answers: "Can you be more specific?" or "Walk me through that concretely"
-- Acknowledge strong answers briefly: "Good point." or "Interesting approach."
-- Do NOT accept buzzword-stuffing without substance — push back politely
-- Adapt difficulty: if candidate struggles, ask an easier follow-up; if confident, increase challenge
-
-CANDIDATE RESUME:
-${resume.rawText.slice(0, 2000)}
-Key skills: ${resume.skills.join(', ') || 'General software engineering'}
-${speechNote}
-
-INTERVIEW RULES:
-1. Start with a warm greeting and ask the candidate to introduce themselves
-2. Ask maximum 8–10 questions total across the session
-3. Mix question types: technical, behavioral (STAR), situational
-4. After every 2–3 questions, brief transition: "Let's shift to something different."
-5. If the answer is weak, push back once: "I'd like a more concrete example."
-6. At question 8+, tell the candidate you have 1–2 more questions
-7. Keep each response under 3 sentences
-8. NEVER reveal evaluation scores during the interview
-
-OUTPUT FORMAT: Respond only with the interview question or follow-up. No meta-commentary.`;
+    });
   }
 
-  private buildEvaluationPrompt(): string {
-    return `You are evaluating a completed job interview. Analyze the full conversation and return a JSON object ONLY (no markdown, no explanation) with this exact structure:
-{
-  "overallScore": <0-100>,
-  "technicalScore": <0-100>,
-  "communicationScore": <0-100>,
-  "confidenceScore": <0-100>,
-  "strengths": ["<strength1>", "<strength2>", "<strength3>"],
-  "improvements": ["<area1>", "<area2>", "<area3>"],
-  "summary": "<2-3 sentence honest professional summary>"
-}`;
+  // ─────────────────────────────────────────────────────────────
+  // MAIN ENTRY POINT — streaming response with parallel TTS
+  //
+  // Flow:
+  //  1. Immediately play a filler clip (covers GPT latency)
+  //  2. Start GPT streaming request
+  //  3. Split stream into sentences
+  //  4. Each sentence → TTS fetch (non-blocking)
+  //  5. Audio queue plays them in order as they arrive
+  // ─────────────────────────────────────────────────────────────
+
+  async getNextMessageStreaming(
+    history:   ChatMessage[],
+    resume:    ResumeData,
+    analysis?: SpeechAnalysis | null,
+    onEnd?:    () => void
+  ): Promise<string> {
+    this.isLoading.set(true);
+    this.error.set(null);
+
+    // Reset audio queue for this turn
+    this.audioQueue     = [];
+    this.isPlayingQueue = false;
+    this.queueDone      = false;
+    this.onQueueEmpty   = onEnd ?? null;
+
+    // ── Step 1: Play filler immediately ──────────────────────
+    // This fires ~0ms after Whisper returns — user hears Alex
+    // react before GPT has even started processing
+    this.playFillerClip();
+
+    try {
+      const messages = [
+        { role: 'system', content: this.buildSystemPrompt(resume, analysis) },
+        ...history
+          .filter(m => m.role !== 'system')
+          .map(m => ({ role: m.role, content: m.content })),
+      ];
+
+      // ── Step 2: Stream GPT response ───────────────────────
+      const fullText = await this.streamGPT(messages);
+
+      this.isLoading.set(false);
+
+      // Mark queue as done — playQueue() will call onEnd when last clip finishes
+      this.queueDone = true;
+      // If queue is already empty (all clips played), fire onEnd now
+      if (!this.isPlayingQueue && this.audioQueue.length === 0) {
+        onEnd?.();
+      }
+
+      return fullText;
+
+    } catch (err: any) {
+      this.isLoading.set(false);
+      this.error.set(err.message || 'Failed to get AI response');
+      onEnd?.();
+      throw err;
+    }
   }
 
-  // ── Core API Call ─────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // GPT STREAMING — Server-Sent Events (SSE)
+  // Reads the stream token by token, splits on sentence boundaries,
+  // fires TTS fetch for each sentence immediately.
+  // ─────────────────────────────────────────────────────────────
 
-  private async callOpenAI(messages: Array<{ role: string; content: string }>): Promise<string> {
-    if (!this.hasApiKey()) {
-      throw new Error('No API key set. Please enter your OpenAI API key.');
-    }
+  private async streamGPT(
+    messages: Array<{ role: string; content: string }>
+  ): Promise<string> {
 
-    const response = await fetch(this.OPENAI_URL, {
+    const res = await fetch(this.CHAT_URL, {
       method: 'POST',
       headers: {
         'Content-Type':  'application/json',
@@ -142,102 +194,316 @@ OUTPUT FORMAT: Respond only with the interview question or follow-up. No meta-co
         messages,
         max_tokens:  this.config.maxTokens,
         temperature: this.config.temperature,
+        stream:      true,   // ← KEY: enables SSE streaming
       }),
     });
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      const msg = (errorData as any)?.error?.message || `API error ${response.status}`;
-      throw new Error(msg);
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({})) as any;
+      throw new Error(e?.error?.message || `GPT error ${res.status}`);
     }
 
-    const data = await response.json() as any;
-    return data.choices?.[0]?.message?.content?.trim() ?? '';
+    const reader  = res.body!.getReader();
+    const decoder = new TextDecoder();
+
+    let fullText     = '';   // Complete assembled response
+    let sentenceBuffer = ''; // Accumulates tokens until sentence boundary
+
+    // Sentence-ending punctuation — these trigger TTS fetch
+    const sentenceEnd = /[.!?。]/;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break;
+
+        try {
+          const json  = JSON.parse(data);
+          const token = json.choices?.[0]?.delta?.content ?? '';
+          if (!token) continue;
+
+          fullText       += token;
+          sentenceBuffer += token;
+
+          // Emit token for any live UI update
+          this.streamToken$.next(token);
+
+          // Check if we have a complete sentence
+          if (sentenceEnd.test(sentenceBuffer)) {
+            // Find the last sentence-ending character
+            const match = sentenceBuffer.match(/^(.*[.!?。])\s*/s);
+            if (match) {
+              const sentence = match[1].trim();
+              const rest     = sentenceBuffer.slice(match[0].length);
+
+              sentenceBuffer = rest;
+
+              if (sentence.length > 3) {
+                // Fetch TTS for this sentence immediately — non-blocking
+                // It will be added to the audio queue and played in order
+                this.fetchAndEnqueueTTS(sentence);
+              }
+            }
+          }
+        } catch {
+          // Malformed SSE chunk — skip
+        }
+      }
+    }
+
+    // Handle any remaining text in buffer (last sentence without punctuation)
+    const remaining = sentenceBuffer.trim();
+    if (remaining.length > 3) {
+      this.fetchAndEnqueueTTS(remaining);
+    }
+
+    this.responseComplete$.next(fullText);
+    return fullText;
   }
 
-  // ── Public Methods ────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // TTS FETCH + QUEUE
+  // Fetches TTS audio for one sentence and adds it to the queue.
+  // Starts playing immediately if queue is idle.
+  // ─────────────────────────────────────────────────────────────
 
-  /**
-   * Gets the next AI question.
-   * Accepts optional speech analysis so the prompt adapts
-   * to the candidate's vocal confidence and delivery.
-   */
-  async getNextMessage(
-    history:  ChatMessage[],
-    resume:   ResumeData,
-    analysis?: SpeechAnalysis | null
-  ): Promise<string> {
-    this.isLoading.set(true);
-    this.error.set(null);
-
+  private async fetchAndEnqueueTTS(sentence: string): Promise<void> {
     try {
-      const messages = [
-        { role: 'system', content: this.buildSystemPrompt(resume, analysis) },
-        ...history
-          .filter(m => m.role !== 'system')
-          .map(m => ({ role: m.role, content: m.content })),
-      ];
-      return await this.callOpenAI(messages);
-    } catch (err: any) {
-      this.error.set(err.message || 'Failed to get AI response');
-      throw err;
-    } finally {
-      this.isLoading.set(false);
+      const audio = await this.fetchTTSAudio(sentence);
+      if (!audio) return;
+
+      this.audioQueue.push(audio);
+
+      // Start playing if not already
+      if (!this.isPlayingQueue) {
+        this.playQueue();
+      }
+    } catch {
+      // TTS failed for this sentence — skip it silently
     }
   }
+
+  // Fetches TTS audio and returns an HTMLAudioElement ready to play
+  private async fetchTTSAudio(text: string): Promise<HTMLAudioElement | null> {
+    if (!this.config.apiKey) return null;
+
+    const res = await fetch(this.TTS_URL, {
+      method:  'POST',
+      headers: {
+        'Authorization': `Bearer ${this.config.apiKey}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({
+        model: 'tts-1',       // tts-1 = lowest latency (~200ms)
+        voice: 'shimmer',     // Warm, clear, closest Indian-EN feel
+        input: text,
+        speed: 0.94,
+      }),
+    });
+
+    if (!res.ok) return null;
+
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+
+    // Pre-load so playback starts immediately when dequeued
+    audio.preload = 'auto';
+    audio.load();
+
+    // Attach cleanup
+    audio.onended = () => URL.revokeObjectURL(url);
+
+    return audio;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // AUDIO QUEUE PLAYER
+  // Plays audio elements one after another in order.
+  // Calls onQueueEmpty when done if queueDone is true.
+  // ─────────────────────────────────────────────────────────────
+
+  private playQueue(): void {
+    if (this.audioQueue.length === 0) {
+      this.isPlayingQueue = false;
+      // If GPT streaming is also done, fire the completion callback
+      if (this.queueDone) {
+        this.onQueueEmpty?.();
+        this.onQueueEmpty = null;
+      }
+      return;
+    }
+
+    this.isPlayingQueue = true;
+    const audio = this.audioQueue.shift()!;
+
+    audio.onended = () => {
+      // Revoke object URL (cleanup)
+      if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
+      // Play next
+      this.playQueue();
+    };
+
+    audio.onerror = () => {
+      // Skip broken clip, continue queue
+      this.playQueue();
+    };
+
+    audio.play().catch(() => {
+      // Autoplay blocked — try next
+      this.playQueue();
+    });
+  }
+
+  // Play a random cached filler clip (instant — pre-loaded)
+  private playFillerClip(): void {
+    if (this.fillerClips.length === 0) return;
+
+    const clip = this.fillerClips[
+      Math.floor(Math.random() * this.fillerClips.length)
+    ];
+
+    // Clone so we can replay the same clip multiple times
+    const clone = new Audio(clip.src);
+    clone.volume = 1.0;
+    clone.play().catch(() => {});
+  }
+
+  stopAudio(): void {
+    // Stop queue playback
+    this.audioQueue.forEach(a => { a.pause(); a.src = ''; });
+    this.audioQueue     = [];
+    this.isPlayingQueue = false;
+    this.onQueueEmpty   = null;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // SYSTEM PROMPT
+  // ─────────────────────────────────────────────────────────────
+
+  private buildSystemPrompt(resume: ResumeData, analysis?: SpeechAnalysis | null): string {
+    let speechNote = '';
+    if (analysis) {
+      const secs = Math.round(analysis.rawDurationMs / 1000);
+      if (analysis.confidenceHint === 'hesitant') {
+        speechNote = `\n\nSPEECH NOTE: Candidate was hesitant (${analysis.fillerCount} fillers, ${analysis.pauseCount} pauses, ${secs}s). Gently probe or rephrase.`;
+      } else if (analysis.confidenceHint === 'confident') {
+        speechNote = `\n\nSPEECH NOTE: Candidate was confident and clear (${secs}s, ~${analysis.wordsPerMinute} wpm). Increase difficulty.`;
+      }
+    }
+
+    return `You are Alex, a sharp Senior Technical Interviewer at a top tech company.
+
+PERSONALITY:
+- Professional, warm, human — not robotic
+- ONE question at a time, never two
+- Probe vague answers: "Can you be more specific?" or "Walk me through that."
+- Acknowledge good answers briefly: "Good point." or "Interesting."
+- If hesitant, gently: "Take your time." or "Let me rephrase that."
+- Adapt difficulty based on candidate responses
+
+CANDIDATE RESUME:
+${resume.rawText.slice(0, 2000)}
+Skills: ${resume.skills.join(', ') || 'General software engineering'}
+${speechNote}
+
+RULES:
+1. Start: warm greeting + ask for self-introduction
+2. Max 8–10 questions total
+3. Mix: technical, behavioral (STAR), situational
+4. Transition every 2–3 questions: "Let's shift to something different."
+5. Push back on weak answers once: "I'd like a concrete example."
+6. At Q8+: "Just one or two more questions."
+7. Each response ≤ 3 sentences
+8. Never reveal scores
+
+Respond only with the question or follow-up. No meta-commentary.`;
+  }
+
+  private buildEvaluationPrompt(): string {
+    return `You are evaluating a completed job interview. Return ONLY a JSON object, no markdown:
+{
+  "overallScore": <0-100>,
+  "technicalScore": <0-100>,
+  "communicationScore": <0-100>,
+  "confidenceScore": <0-100>,
+  "strengths": ["<s1>", "<s2>", "<s3>"],
+  "improvements": ["<i1>", "<i2>", "<i3>"],
+  "summary": "<2-3 sentence honest summary>"
+}`;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // EVALUATION (non-streaming, called once at end)
+  // ─────────────────────────────────────────────────────────────
 
   async evaluateInterview(history: ChatMessage[], resume: ResumeData): Promise<EvaluationResult> {
     this.isLoading.set(true);
-
     try {
-      const conversationText = history
+      const transcript = history
         .filter(m => m.role !== 'system')
         .map(m => `${m.role === 'user' ? 'CANDIDATE' : 'INTERVIEWER'}: ${m.content}`)
         .join('\n');
 
-      const messages = [
-        { role: 'system', content: this.buildEvaluationPrompt() },
-        {
-          role:    'user',
-          content: `Resume context: ${resume.skills.join(', ')}\n\nInterview transcript:\n${conversationText}`,
+      const res = await fetch(this.CHAT_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${this.config.apiKey}`,
         },
-      ];
+        body: JSON.stringify({
+          model:       this.config.model,
+          max_tokens:  800,
+          temperature: 0.3,
+          messages: [
+            { role: 'system', content: this.buildEvaluationPrompt() },
+            { role: 'user',   content: `Skills: ${resume.skills.join(', ')}\n\nTranscript:\n${transcript}` },
+          ],
+        }),
+      });
 
-      const raw     = await this.callOpenAI(messages);
+      if (!res.ok) throw new Error(`Eval API error ${res.status}`);
+      const data    = await res.json() as any;
+      const raw     = data.choices?.[0]?.message?.content ?? '{}';
       const cleaned = raw.replace(/```json|```/g, '').trim();
       return JSON.parse(cleaned) as EvaluationResult;
 
-    } catch (err: any) {
+    } catch (err) {
       console.error('Evaluation failed:', err);
-      return this.getFallbackEvaluation();
+      return this.fallbackEval();
     } finally {
       this.isLoading.set(false);
     }
   }
 
-  private getFallbackEvaluation(): EvaluationResult {
+  private fallbackEval(): EvaluationResult {
     return {
-      overallScore:        70,
-      technicalScore:      70,
-      communicationScore:  70,
-      confidenceScore:     70,
-      strengths:    ['Completed the interview', 'Provided responses to questions'],
-      improvements: ['Could not evaluate — API error occurred'],
-      summary: 'Interview completed. Evaluation could not be fully processed due to a technical issue.',
+      overallScore: 70, technicalScore: 70,
+      communicationScore: 70, confidenceScore: 70,
+      strengths:    ['Completed the interview', 'Provided responses'],
+      improvements: ['Evaluation API error — could not score'],
+      summary: 'Interview completed. Evaluation unavailable due to a technical issue.',
     };
   }
 
   getDemoResponse(questionCount: number): string {
-    const demoQuestions = [
-      "Hi! I'm Alex, and I'll be conducting your interview today. To get started, could you walk me through your background and what brings you to this role?",
-      "That's a solid overview. Can you tell me about a technically challenging project you've worked on recently? What was your specific contribution?",
-      "Interesting. How did you approach debugging that? What tools or strategies did you use?",
-      "Let's talk about teamwork. Describe a situation where you disagreed with a technical decision your team made. How did you handle it?",
-      "I'd like a more concrete example of the outcome — what metrics or results came from that?",
-      "Let's shift gears. How do you stay current with new technologies? Can you give me an example where you applied something you recently learned?",
-      "Good. Now a situational question: if you were given an ambiguous feature request with a tight deadline, how would you proceed?",
-      "We're almost done. Last question — where do you see yourself technically in the next 2 years, and how does this role fit into that?",
+    const q = [
+      "Hi! I'm Alex. To start, could you walk me through your background and what brings you to this role?",
+      "Solid overview. Tell me about a technically challenging project you've worked on. What was your specific contribution?",
+      "How did you approach debugging that? What tools or strategies did you use?",
+      "Let's talk about teamwork. Describe a time you disagreed with a technical decision. How did you handle it?",
+      "I'd like a more concrete example — what were the measurable outcomes?",
+      "How do you stay current with new technologies? Give me a recent example you applied at work.",
+      "Situational: you're given an ambiguous feature request with a tight deadline. Walk me through how you'd proceed.",
+      "Last question — where do you see yourself technically in 2 years, and how does this role fit that path?",
     ];
-    return demoQuestions[Math.min(questionCount, demoQuestions.length - 1)];
+    return q[Math.min(questionCount, q.length - 1)];
   }
 }

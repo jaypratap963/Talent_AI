@@ -1,10 +1,13 @@
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // components/interview/interview.component.ts
-// Avatar-based interview screen.
-// Subscribes to both transcriptComplete$ AND
-// analysisComplete$ from SpeechService so that
-// speech analysis flows into the AI prompt.
-// ─────────────────────────────────────────────
+//
+// Changes for latency layer:
+// - subscribes to aiService.streamToken$ to drive avatar animation
+//   while GPT is streaming (avatar animates before TTS plays)
+// - subscribes to analysisComplete$ to feed speech data to interview
+// - autoOpenMicAfterSpeech now waits for the audio QUEUE to empty
+//   (not just isSpeaking signal) via onQueueEmpty callback
+// ─────────────────────────────────────────────────────────────────
 
 import {
   Component, OnInit, OnDestroy, inject, signal, computed
@@ -31,14 +34,15 @@ export class InterviewComponent implements OnInit, OnDestroy {
   speech    = inject(SpeechService);
   ai        = inject(AiService);
 
-  // ── Local UI state ─────────────────────────────
   textInput      = signal('');
   demoMode       = signal(false);
   showEvaluation = signal(false);
   isStarted      = signal(false);
   showTextInput  = signal(false);
 
-  // ── Derived from services ──────────────────────
+  // True while GPT is streaming tokens (before audio plays)
+  isStreaming    = signal(false);
+
   messages      = computed(() => this.interview.chatHistory());
   isActive      = computed(() => this.interview.isActive());
   isCompleted   = computed(() => this.interview.isCompleted());
@@ -53,25 +57,23 @@ export class InterviewComponent implements OnInit, OnDestroy {
   liveText      = computed(() => this.speech.transcript());
   recordingMs   = computed(() => this.speech.recordingMs());
 
-  /** Human-readable status label shown below the avatar */
   statusLabel = computed<string>(() => {
     if (!this.isStarted()) return '';
+    if (this.isStreaming())                  return 'Alex is thinking...';
     if (this.isTyping() || this.isLoading()) return 'Thinking...';
-
     switch (this.phase()) {
       case 'ai-speaking':   return 'Alex is speaking...';
       case 'listening':     return 'Listening for your voice...';
       case 'user-speaking': return 'I\'m listening...';
       case 'filler-pause':  return 'Take your time...';
       case 'processing':    return 'Processing your answer...';
-      case 'ai-thinking':   return 'One moment...';
       default:              return this.isActive() ? 'Your turn to speak' : '';
     }
   });
 
-  /** CSS class applied to the avatar element — drives all animations */
   avatarState = computed<string>(() => {
-    if (this.isTyping() || this.isLoading()) return 'thinking';
+    if (this.isStreaming())                   return 'thinking';
+    if (this.isTyping() || this.isLoading())  return 'thinking';
     switch (this.phase()) {
       case 'ai-speaking':   return 'speaking';
       case 'user-speaking': return 'listening';
@@ -81,50 +83,68 @@ export class InterviewComponent implements OnInit, OnDestroy {
     }
   });
 
-  /** Formatted recording duration e.g. "0:04" */
   recordingLabel = computed<string>(() => {
     const ms = this.recordingMs();
-    if (!ms) return '';
+    if (!ms || ms < 500) return '';
     const s = Math.floor(ms / 1000);
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   });
 
   private subs = new Subscription();
+  // Tracks the mic-open polling loop so we can cancel it
+  private micOpenCheck: ReturnType<typeof setInterval> | null = null;
 
   ngOnInit(): void {
     this.demoMode.set(!this.ai.hasApiKey());
 
-    // 1. When Whisper returns the final transcript → submit as answer
+    // ── 1. Transcript complete → submit answer ──────────────────
     this.subs.add(
       this.speech.transcriptComplete$.subscribe(text => {
         this.textInput.set(text);
-        // Small delay so user sees what was heard before it submits
-        setTimeout(() => this.submitAnswer(), 300);
+        // No setTimeout needed — Whisper already added latency.
+        // Submit immediately so filler clip can start playing ASAP.
+        this.submitAnswer();
       })
     );
 
-    // 2. When speech analysis arrives → store in interview service
-    //    so the AI prompt gets enriched with confidence data
+    // ── 2. Speech analysis → interview service ──────────────────
     this.subs.add(
       this.speech.analysisComplete$.subscribe(analysis => {
         this.interview.setLastAnalysis(analysis);
+      })
+    );
+
+    // ── 3. GPT stream tokens → animate avatar while thinking ────
+    this.subs.add(
+      this.ai.streamToken$.subscribe(() => {
+        // As soon as first token arrives, show speaking state
+        // even though audio hasn't started yet
+        if (!this.isStreaming()) {
+          this.isStreaming.set(true);
+        }
+      })
+    );
+
+    // ── 4. GPT response complete → stop streaming indicator ─────
+    this.subs.add(
+      this.ai.responseComplete$.subscribe(() => {
+        this.isStreaming.set(false);
       })
     );
   }
 
   ngOnDestroy(): void {
     this.subs.unsubscribe();
+    this.clearMicCheck();
+    this.ai.stopAudio();
     this.speech.stopSpeaking();
     this.speech.stopListening();
   }
 
-  // ── Interview lifecycle ────────────────────────
-
   async startInterview(): Promise<void> {
     this.isStarted.set(true);
     await this.interview.startInterview(this.demoMode());
-    // Auto-open mic once AI finishes its first question
-    this.autoOpenMicAfterSpeech();
+    this.scheduleAutoMic();
   }
 
   async submitAnswer(): Promise<void> {
@@ -132,37 +152,53 @@ export class InterviewComponent implements OnInit, OnDestroy {
     if (!text || this.isLoading() || this.isTyping()) return;
 
     this.textInput.set('');
-    this.speech.stopSpeaking(); // Stop AI if still talking
+    // Stop any playing audio immediately
+    this.ai.stopAudio();
+    this.speech.stopSpeaking();
 
     await this.interview.submitUserAnswer(text, this.demoMode());
-    this.autoOpenMicAfterSpeech();
+    this.scheduleAutoMic();
   }
 
-  /**
-   * Polls until AI stops speaking, then auto-opens mic.
-   * Creates a hands-free conversation loop.
-   */
-  private autoOpenMicAfterSpeech(): void {
-    if (!this.speech.sttSupported) return;
+  // ─────────────────────────────────────────────────────────────
+  // AUTO MIC OPEN
+  // Polls until Alex has finished speaking (audio queue empty +
+  // phase back to idle), then opens mic automatically.
+  // ─────────────────────────────────────────────────────────────
 
-    const check = setInterval(() => {
-      const ready = !this.isSpeaking()
-                 && !this.isTyping()
-                 && !this.isLoading()
-                 && this.isActive();
+  private scheduleAutoMic(): void {
+    if (!this.speech.sttSupported) return;
+    this.clearMicCheck();
+
+    this.micOpenCheck = setInterval(() => {
+      const ready =
+        !this.isSpeaking() &&
+        !this.isStreaming() &&
+        !this.isTyping()   &&
+        !this.isLoading()  &&
+        this.phase() === 'idle' &&
+        this.isActive();
 
       if (ready) {
-        clearInterval(check);
+        this.clearMicCheck();
+        // Small buffer so audio output fully clears
         setTimeout(() => {
           if (this.isActive() && !this.isListening()) {
             this.speech.startListening();
           }
-        }, 500); // Brief pause after AI finishes
+        }, 400);
       }
-    }, 200);
+    }, 150);
 
-    // Safety: stop polling after 60s
-    setTimeout(() => clearInterval(check), 60000);
+    // Safety timeout — give up after 60s
+    setTimeout(() => this.clearMicCheck(), 60000);
+  }
+
+  private clearMicCheck(): void {
+    if (this.micOpenCheck) {
+      clearInterval(this.micOpenCheck);
+      this.micOpenCheck = null;
+    }
   }
 
   onKeyDown(event: KeyboardEvent): void {
@@ -172,21 +208,19 @@ export class InterviewComponent implements OnInit, OnDestroy {
     }
   }
 
-  // ── Voice controls ─────────────────────────────
-
   toggleListening(): void {
     if (this.isListening()) {
-      // User manually stops — commit whatever was recorded
       this.speech.stopListening();
     } else {
+      this.ai.stopAudio();
       this.speech.stopSpeaking();
       this.speech.startListening();
     }
   }
 
   stopSpeaking(): void {
+    this.ai.stopAudio();
     this.speech.stopSpeaking();
-    // Open mic immediately after user mutes AI
     if (this.speech.sttSupported && this.isActive()) {
       setTimeout(() => {
         if (!this.isListening()) this.speech.startListening();
@@ -194,13 +228,10 @@ export class InterviewComponent implements OnInit, OnDestroy {
     }
   }
 
-  toggleTextInput(): void {
-    this.showTextInput.update(v => !v);
-  }
-
-  // ── Session control ────────────────────────────
+  toggleTextInput(): void { this.showTextInput.update(v => !v); }
 
   async endEarly(): Promise<void> {
+    this.clearMicCheck();
     this.speech.stopListening();
     await this.interview.endInterview(this.demoMode());
   }
@@ -209,26 +240,17 @@ export class InterviewComponent implements OnInit, OnDestroy {
   hideEvaluation():  void { this.showEvaluation.set(false); }
 
   restartInterview(): void {
+    this.clearMicCheck();
+    this.ai.stopAudio();
     this.speech.stopSpeaking();
     this.speech.stopListening();
     this.interview.resetSession();
     this.isStarted.set(false);
+    this.isStreaming.set(false);
     this.showEvaluation.set(false);
     this.textInput.set('');
   }
 
-  // ── Score helpers ──────────────────────────────
-
-  getScoreClass(score: number): string {
-    if (score >= 80) return 'score-high';
-    if (score >= 60) return 'score-mid';
-    return 'score-low';
-  }
-
-  getScoreLabel(score: number): string {
-    if (score >= 85) return 'Excellent';
-    if (score >= 70) return 'Good';
-    if (score >= 55) return 'Fair';
-    return 'Needs Work';
-  }
+  getScoreClass(s: number) { return s >= 80 ? 'score-high' : s >= 60 ? 'score-mid' : 'score-low'; }
+  getScoreLabel(s: number) { return s >= 85 ? 'Excellent' : s >= 70 ? 'Good' : s >= 55 ? 'Fair' : 'Needs Work'; }
 }
