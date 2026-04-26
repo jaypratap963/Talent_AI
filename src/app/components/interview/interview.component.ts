@@ -1,12 +1,17 @@
 // ─────────────────────────────────────────────────────────────────
 // components/interview/interview.component.ts
 //
-// Changes for latency layer:
-// - subscribes to aiService.streamToken$ to drive avatar animation
-//   while GPT is streaming (avatar animates before TTS plays)
-// - subscribes to analysisComplete$ to feed speech data to interview
-// - autoOpenMicAfterSpeech now waits for the audio QUEUE to empty
-//   (not just isSpeaking signal) via onQueueEmpty callback
+// Single service source: SpeechService only.
+// StreamingSpeechService removed — it was the root cause of the bug.
+//
+// FLOW:
+//   VAD commits → SpeechService.processRecording()
+//     → Whisper returns real transcript
+//     → analysisComplete$ → interview.setLastAnalysis()
+//     → transcriptComplete$ → submitAnswer()
+//     → interview.sendAIMessage()
+//       → filler clip + GPT stream + sentence TTS queue
+//       → onEnd callback → scheduleAutoMic()
 // ─────────────────────────────────────────────────────────────────
 
 import {
@@ -39,32 +44,32 @@ export class InterviewComponent implements OnInit, OnDestroy {
   showEvaluation = signal(false);
   isStarted      = signal(false);
   showTextInput  = signal(false);
-
-  // True while GPT is streaming tokens (before audio plays)
   isStreaming    = signal(false);
 
-  messages      = computed(() => this.interview.chatHistory());
-  isActive      = computed(() => this.interview.isActive());
-  isCompleted   = computed(() => this.interview.isCompleted());
-  isLoading     = computed(() => this.ai.isLoading());
-  isTyping      = computed(() => this.interview.isTyping());
-  evaluation    = computed(() => this.interview.session().evaluation);
-  questionNum   = computed(() => this.interview.questionCount());
-  currentQ      = computed(() => this.interview.session().currentQuestion);
-  phase         = computed(() => this.speech.phase());
-  isSpeaking    = computed(() => this.speech.isSpeaking());
-  isListening   = computed(() => this.speech.isListening());
-  liveText      = computed(() => this.speech.transcript());
-  recordingMs   = computed(() => this.speech.recordingMs());
+  messages    = computed(() => this.interview.chatHistory());
+  isActive    = computed(() => this.interview.isActive());
+  isCompleted = computed(() => this.interview.isCompleted());
+  isLoading   = computed(() => this.ai.isLoading());
+  isTyping    = computed(() => this.interview.isTyping());
+  evaluation  = computed(() => this.interview.session().evaluation);
+  questionNum = computed(() => this.interview.questionCount());
+  currentQ    = computed(() => this.interview.session().currentQuestion);
+  phase       = computed(() => this.speech.phase());
+  isSpeaking  = computed(() => this.speech.isSpeaking());
+  isListening = computed(() => this.speech.isListening());
+  // liveText shows VAD status ("🎙 Recording...") not the transcript
+  // The real transcript only appears after Whisper returns
+  liveText    = computed(() => this.speech.transcript());
+  recordingMs = computed(() => this.speech.recordingMs());
 
   statusLabel = computed<string>(() => {
     if (!this.isStarted()) return '';
-    if (this.isStreaming())                  return 'Alex is thinking...';
-    if (this.isTyping() || this.isLoading()) return 'Thinking...';
+    if (this.isStreaming())                   return 'Alex is thinking...';
+    if (this.isTyping() || this.isLoading())  return 'Thinking...';
     switch (this.phase()) {
       case 'ai-speaking':   return 'Alex is speaking...';
       case 'listening':     return 'Listening for your voice...';
-      case 'user-speaking': return 'I\'m listening...';
+      case 'user-speaking': return "I'm listening...";
       case 'filler-pause':  return 'Take your time...';
       case 'processing':    return 'Processing your answer...';
       default:              return this.isActive() ? 'Your turn to speak' : '';
@@ -91,41 +96,39 @@ export class InterviewComponent implements OnInit, OnDestroy {
   });
 
   private subs = new Subscription();
-  // Tracks the mic-open polling loop so we can cancel it
   private micOpenCheck: ReturnType<typeof setInterval> | null = null;
 
   ngOnInit(): void {
     this.demoMode.set(!this.ai.hasApiKey());
 
-    // ── 1. Transcript complete → submit answer ──────────────────
-    this.subs.add(
-      this.speech.transcriptComplete$.subscribe(text => {
-        this.textInput.set(text);
-        // No setTimeout needed — Whisper already added latency.
-        // Submit immediately so filler clip can start playing ASAP.
-        this.submitAnswer();
-      })
-    );
-
-    // ── 2. Speech analysis → interview service ──────────────────
+    // 1. Analysis arrives first — store it before transcript fires
     this.subs.add(
       this.speech.analysisComplete$.subscribe(analysis => {
         this.interview.setLastAnalysis(analysis);
       })
     );
 
-    // ── 3. GPT stream tokens → animate avatar while thinking ────
+    // 2. Whisper transcript ready — submit as answer
     this.subs.add(
-      this.ai.streamToken$.subscribe(() => {
-        // As soon as first token arrives, show speaking state
-        // even though audio hasn't started yet
-        if (!this.isStreaming()) {
-          this.isStreaming.set(true);
-        }
+      this.speech.transcriptComplete$.subscribe(text => {
+        // Guard: ignore status strings that slipped through
+        // (shouldn't happen now, but safety net)
+        const isStatusText = ['🎙 Recording...', 'Transcribing...', 'Processing...', 'Take your time...', 'Listening...'].includes(text);
+        if (isStatusText) return;
+
+        this.textInput.set(text);
+        this.submitAnswer();
       })
     );
 
-    // ── 4. GPT response complete → stop streaming indicator ─────
+    // 3. GPT streaming token → animate avatar immediately
+    this.subs.add(
+      this.ai.streamToken$.subscribe(() => {
+        if (!this.isStreaming()) this.isStreaming.set(true);
+      })
+    );
+
+    // 4. GPT response assembled → stop streaming indicator
     this.subs.add(
       this.ai.responseComplete$.subscribe(() => {
         this.isStreaming.set(false);
@@ -141,6 +144,8 @@ export class InterviewComponent implements OnInit, OnDestroy {
     this.speech.stopListening();
   }
 
+  // ── Interview lifecycle ────────────────────────────────────────
+
   async startInterview(): Promise<void> {
     this.isStarted.set(true);
     await this.interview.startInterview(this.demoMode());
@@ -151,8 +156,14 @@ export class InterviewComponent implements OnInit, OnDestroy {
     const text = this.textInput().trim();
     if (!text || this.isLoading() || this.isTyping()) return;
 
+    // Final guard against status strings
+    const junkStrings = ['🎙 Recording...', 'Transcribing...', 'Processing your answer...', 'Listening...', 'Take your time...', '[Demo mode — type your answer instead]'];
+    if (junkStrings.some(j => text.includes(j))) {
+      this.textInput.set('');
+      return;
+    }
+
     this.textInput.set('');
-    // Stop any playing audio immediately
     this.ai.stopAudio();
     this.speech.stopSpeaking();
 
@@ -162,8 +173,9 @@ export class InterviewComponent implements OnInit, OnDestroy {
 
   // ─────────────────────────────────────────────────────────────
   // AUTO MIC OPEN
-  // Polls until Alex has finished speaking (audio queue empty +
-  // phase back to idle), then opens mic automatically.
+  // Waits until Alex finishes speaking AND phase returns to idle,
+  // then opens mic. The 150ms polling is fine — it only runs for
+  // at most the duration of Alex's response (~5-15s).
   // ─────────────────────────────────────────────────────────────
 
   private scheduleAutoMic(): void {
@@ -172,25 +184,23 @@ export class InterviewComponent implements OnInit, OnDestroy {
 
     this.micOpenCheck = setInterval(() => {
       const ready =
-        !this.isSpeaking() &&
-        !this.isStreaming() &&
-        !this.isTyping()   &&
-        !this.isLoading()  &&
+        !this.isSpeaking()   &&
+        !this.isStreaming()  &&
+        !this.isTyping()     &&
+        !this.isLoading()    &&
         this.phase() === 'idle' &&
         this.isActive();
 
       if (ready) {
         this.clearMicCheck();
-        // Small buffer so audio output fully clears
         setTimeout(() => {
           if (this.isActive() && !this.isListening()) {
             this.speech.startListening();
           }
-        }, 400);
+        }, 500); // 500ms buffer after audio clears
       }
     }, 150);
 
-    // Safety timeout — give up after 60s
     setTimeout(() => this.clearMicCheck(), 60000);
   }
 

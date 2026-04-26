@@ -20,19 +20,21 @@
 //  ~300ms after GPT emits the first sentence.
 // ─────────────────────────────────────────────────────────────────
 
-import { Injectable, signal } from '@angular/core';
-import { Subject } from 'rxjs';
+import { Injectable, signal } from "@angular/core";
+import { Subject } from "rxjs";
 import {
-  ChatMessage, EvaluationResult, ResumeData, AIConfig
-} from '../models/interview.models';
-import { SpeechAnalysis } from './speech.service';
-import { SpeechService } from './speech.service';
+  ChatMessage,
+  EvaluationResult,
+  ResumeData,
+  AIConfig,
+} from "../models/interview.models";
+import { SpeechAnalysis } from "./speech.service";
+import { SpeechService } from "./speech.service";
 
-@Injectable({ providedIn: 'root' })
+@Injectable({ providedIn: "root" })
 export class AiService {
-
   isLoading = signal(false);
-  error     = signal<string | null>(null);
+  error = signal<string | null>(null);
 
   // Emits each sentence token as it streams in (drives avatar mouth)
   streamToken$ = new Subject<string>();
@@ -40,21 +42,21 @@ export class AiService {
   responseComplete$ = new Subject<string>();
 
   private config: AIConfig = {
-    apiKey:      '',
-    model:       'gpt-4o-mini',
-    maxTokens:   500,
+    apiKey: "",
+    model: "gpt-4o-mini",
+    maxTokens: 500,
     temperature: 0.75,
   };
 
-  private readonly CHAT_URL  = 'https://api.openai.com/v1/chat/completions';
-  private readonly TTS_URL   = 'https://api.openai.com/v1/audio/speech';
+  private readonly CHAT_URL = "https://api.openai.com/v1/chat/completions";
+  private readonly TTS_URL = "https://api.openai.com/v1/audio/speech";
 
   // ── Audio queue for sentence-by-sentence playback ─────────────
   // Each sentence is fetched in parallel; played in order.
-  private audioQueue:     HTMLAudioElement[] = [];
-  private isPlayingQueue  = false;
-  private queueDone       = false;   // set when GPT stream ends + all TTS fetched
-  private onQueueEmpty:   (() => void) | null = null;
+  private audioQueue: HTMLAudioElement[] = [];
+  private isPlayingQueue = false;
+  private queueDone = false; // set when GPT stream ends + all TTS fetched
+  private onQueueEmpty: (() => void) | null = null;
 
   // Pre-cached filler audio blobs (loaded once at startup)
   private fillerClips: HTMLAudioElement[] = [];
@@ -91,22 +93,17 @@ export class AiService {
     if (this.fillersLoaded || !this.config.apiKey) return;
     this.fillersLoaded = true;
 
-    const fillerTexts = [
-      'Mmm, right.',
-      'Okay.',
-      'I see.',
-      'Interesting.',
-    ];
+    const fillerTexts = ["Mmm, right.", "Okay.", "I see.", "Interesting."];
 
     // Fetch all in parallel — each is ~0.3s of audio
-    const fetches = fillerTexts.map(text =>
-      this.fetchTTSAudio(text).catch(() => null)
+    const fetches = fillerTexts.map((text) =>
+      this.fetchTTSAudio(text).catch(() => null),
     );
 
     const results = await Promise.allSettled(fetches);
 
-    results.forEach(r => {
-      if (r.status === 'fulfilled' && r.value) {
+    results.forEach((r) => {
+      if (r.status === "fulfilled" && r.value) {
         this.fillerClips.push(r.value);
       }
     });
@@ -124,19 +121,19 @@ export class AiService {
   // ─────────────────────────────────────────────────────────────
 
   async getNextMessageStreaming(
-    history:   ChatMessage[],
-    resume:    ResumeData,
+    history: ChatMessage[],
+    resume: ResumeData,
     analysis?: SpeechAnalysis | null,
-    onEnd?:    () => void
+    onEnd?: () => void,
   ): Promise<string> {
     this.isLoading.set(true);
     this.error.set(null);
 
     // Reset audio queue for this turn
-    this.audioQueue     = [];
+    this.audioQueue = [];
     this.isPlayingQueue = false;
-    this.queueDone      = false;
-    this.onQueueEmpty   = onEnd ?? null;
+    this.queueDone = false;
+    this.onQueueEmpty = onEnd ?? null;
 
     // ── Step 1: Play filler immediately ──────────────────────
     // This fires ~0ms after Whisper returns — user hears Alex
@@ -145,10 +142,10 @@ export class AiService {
 
     try {
       const messages = [
-        { role: 'system', content: this.buildSystemPrompt(resume, analysis) },
+        { role: "system", content: this.buildSystemPrompt(resume, analysis) },
         ...history
-          .filter(m => m.role !== 'system')
-          .map(m => ({ role: m.role, content: m.content })),
+          .filter((m) => m.role !== "system")
+          .map((m) => ({ role: m.role, content: m.content })),
       ];
 
       // ── Step 2: Stream GPT response ───────────────────────
@@ -164,10 +161,9 @@ export class AiService {
       }
 
       return fullText;
-
     } catch (err: any) {
       this.isLoading.set(false);
-      this.error.set(err.message || 'Failed to get AI response');
+      this.error.set(err.message || "Failed to get AI response");
       onEnd?.();
       throw err;
     }
@@ -180,34 +176,33 @@ export class AiService {
   // ─────────────────────────────────────────────────────────────
 
   private async streamGPT(
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{ role: string; content: string }>,
   ): Promise<string> {
-
     const res = await fetch(this.CHAT_URL, {
-      method: 'POST',
+      method: "POST",
       headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Bearer ${this.config.apiKey}`,
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.config.apiKey}`,
       },
       body: JSON.stringify({
-        model:       this.config.model,
+        model: this.config.model,
         messages,
-        max_tokens:  this.config.maxTokens,
+        max_tokens: this.config.maxTokens,
         temperature: this.config.temperature,
-        stream:      true,   // ← KEY: enables SSE streaming
+        stream: true, // ← KEY: enables SSE streaming
       }),
     });
 
     if (!res.ok) {
-      const e = await res.json().catch(() => ({})) as any;
+      const e = (await res.json().catch(() => ({}))) as any;
       throw new Error(e?.error?.message || `GPT error ${res.status}`);
     }
 
-    const reader  = res.body!.getReader();
+    const reader = res.body!.getReader();
     const decoder = new TextDecoder();
 
-    let fullText     = '';   // Complete assembled response
-    let sentenceBuffer = ''; // Accumulates tokens until sentence boundary
+    let fullText = ""; // Complete assembled response
+    let sentenceBuffer = ""; // Accumulates tokens until sentence boundary
 
     // Sentence-ending punctuation — these trigger TTS fetch
     const sentenceEnd = /[.!?。]/;
@@ -217,19 +212,19 @@ export class AiService {
       if (done) break;
 
       const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split('\n');
+      const lines = chunk.split("\n");
 
       for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
+        if (!line.startsWith("data: ")) continue;
         const data = line.slice(6).trim();
-        if (data === '[DONE]') break;
+        if (data === "[DONE]") break;
 
         try {
-          const json  = JSON.parse(data);
-          const token = json.choices?.[0]?.delta?.content ?? '';
+          const json = JSON.parse(data);
+          const token = json.choices?.[0]?.delta?.content ?? "";
           if (!token) continue;
 
-          fullText       += token;
+          fullText += token;
           sentenceBuffer += token;
 
           // Emit token for any live UI update
@@ -241,7 +236,7 @@ export class AiService {
             const match = sentenceBuffer.match(/^(.*[.!?。])\s*/s);
             if (match) {
               const sentence = match[1].trim();
-              const rest     = sentenceBuffer.slice(match[0].length);
+              const rest = sentenceBuffer.slice(match[0].length);
 
               sentenceBuffer = rest;
 
@@ -295,14 +290,14 @@ export class AiService {
     if (!this.config.apiKey) return null;
 
     const res = await fetch(this.TTS_URL, {
-      method:  'POST',
+      method: "POST",
       headers: {
-        'Authorization': `Bearer ${this.config.apiKey}`,
-        'Content-Type':  'application/json',
+        Authorization: `Bearer ${this.config.apiKey}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: 'tts-1',       // tts-1 = lowest latency (~200ms)
-        voice: 'shimmer',     // Warm, clear, closest Indian-EN feel
+        model: "tts-1", // tts-1 = lowest latency (~200ms)
+        voice: "shimmer", // Warm, clear, closest Indian-EN feel
         input: text,
         speed: 0.94,
       }),
@@ -311,11 +306,11 @@ export class AiService {
     if (!res.ok) return null;
 
     const blob = await res.blob();
-    const url  = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
 
     // Pre-load so playback starts immediately when dequeued
-    audio.preload = 'auto';
+    audio.preload = "auto";
     audio.load();
 
     // Attach cleanup
@@ -335,6 +330,7 @@ export class AiService {
       this.isPlayingQueue = false;
       // If GPT streaming is also done, fire the completion callback
       if (this.queueDone) {
+        this.speechService.isSpeaking.set(false);
         this.onQueueEmpty?.();
         this.onQueueEmpty = null;
       }
@@ -342,11 +338,13 @@ export class AiService {
     }
 
     this.isPlayingQueue = true;
+    this.speechService.isSpeaking.set(true);
+    this.speechService.phase.set("ai-speaking");
     const audio = this.audioQueue.shift()!;
 
     audio.onended = () => {
       // Revoke object URL (cleanup)
-      if (audio.src.startsWith('blob:')) URL.revokeObjectURL(audio.src);
+      if (audio.src.startsWith("blob:")) URL.revokeObjectURL(audio.src);
       // Play next
       this.playQueue();
     };
@@ -366,9 +364,17 @@ export class AiService {
   private playFillerClip(): void {
     if (this.fillerClips.length === 0) return;
 
-    const clip = this.fillerClips[
-      Math.floor(Math.random() * this.fillerClips.length)
-    ];
+    // NEW: kill mic and mark AI as speaking the moment the filler fires
+    // This is t=0 — before GPT even starts — so the mic closes instantly
+    if (this.speechService.isListening()) {
+      this.speechService.muteVAD(true);
+      this.speechService.stopListening();
+    }
+    this.speechService.isSpeaking.set(true);
+    this.speechService.phase.set("ai-speaking");
+
+    const clip =
+      this.fillerClips[Math.floor(Math.random() * this.fillerClips.length)];
 
     // Clone so we can replay the same clip multiple times
     const clone = new Audio(clip.src);
@@ -378,23 +384,34 @@ export class AiService {
 
   stopAudio(): void {
     // Stop queue playback
-    this.audioQueue.forEach(a => { a.pause(); a.src = ''; });
-    this.audioQueue     = [];
+    this.audioQueue.forEach((a) => {
+      a.pause();
+      a.src = "";
+    });
+    this.audioQueue = [];
     this.isPlayingQueue = false;
-    this.onQueueEmpty   = null;
+    this.onQueueEmpty = null;
+
+    // NEW: reset SpeechService state when audio is force-stopped
+    // (e.g. user taps "Mute Alex" mid-sentence)
+    this.speechService.isSpeaking.set(false);
+    this.speechService.muteVAD(false); // re-arm VAD
   }
 
   // ─────────────────────────────────────────────────────────────
   // SYSTEM PROMPT
   // ─────────────────────────────────────────────────────────────
 
-  private buildSystemPrompt(resume: ResumeData, analysis?: SpeechAnalysis | null): string {
-    let speechNote = '';
+  private buildSystemPrompt(
+    resume: ResumeData,
+    analysis?: SpeechAnalysis | null,
+  ): string {
+    let speechNote = "";
     if (analysis) {
       const secs = Math.round(analysis.rawDurationMs / 1000);
-      if (analysis.confidenceHint === 'hesitant') {
+      if (analysis.confidenceHint === "hesitant") {
         speechNote = `\n\nSPEECH NOTE: Candidate was hesitant (${analysis.fillerCount} fillers, ${analysis.pauseCount} pauses, ${secs}s). Gently probe or rephrase.`;
-      } else if (analysis.confidenceHint === 'confident') {
+      } else if (analysis.confidenceHint === "confident") {
         speechNote = `\n\nSPEECH NOTE: Candidate was confident and clear (${secs}s, ~${analysis.wordsPerMinute} wpm). Increase difficulty.`;
       }
     }
@@ -411,7 +428,7 @@ PERSONALITY:
 
 CANDIDATE RESUME:
 ${resume.rawText.slice(0, 2000)}
-Skills: ${resume.skills.join(', ') || 'General software engineering'}
+Skills: ${resume.skills.join(", ") || "General software engineering"}
 ${speechNote}
 
 RULES:
@@ -444,39 +461,47 @@ Respond only with the question or follow-up. No meta-commentary.`;
   // EVALUATION (non-streaming, called once at end)
   // ─────────────────────────────────────────────────────────────
 
-  async evaluateInterview(history: ChatMessage[], resume: ResumeData): Promise<EvaluationResult> {
+  async evaluateInterview(
+    history: ChatMessage[],
+    resume: ResumeData,
+  ): Promise<EvaluationResult> {
     this.isLoading.set(true);
     try {
       const transcript = history
-        .filter(m => m.role !== 'system')
-        .map(m => `${m.role === 'user' ? 'CANDIDATE' : 'INTERVIEWER'}: ${m.content}`)
-        .join('\n');
+        .filter((m) => m.role !== "system")
+        .map(
+          (m) =>
+            `${m.role === "user" ? "CANDIDATE" : "INTERVIEWER"}: ${m.content}`,
+        )
+        .join("\n");
 
       const res = await fetch(this.CHAT_URL, {
-        method: 'POST',
+        method: "POST",
         headers: {
-          'Content-Type':  'application/json',
-          'Authorization': `Bearer ${this.config.apiKey}`,
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify({
-          model:       this.config.model,
-          max_tokens:  800,
+          model: this.config.model,
+          max_tokens: 800,
           temperature: 0.3,
           messages: [
-            { role: 'system', content: this.buildEvaluationPrompt() },
-            { role: 'user',   content: `Skills: ${resume.skills.join(', ')}\n\nTranscript:\n${transcript}` },
+            { role: "system", content: this.buildEvaluationPrompt() },
+            {
+              role: "user",
+              content: `Skills: ${resume.skills.join(", ")}\n\nTranscript:\n${transcript}`,
+            },
           ],
         }),
       });
 
       if (!res.ok) throw new Error(`Eval API error ${res.status}`);
-      const data    = await res.json() as any;
-      const raw     = data.choices?.[0]?.message?.content ?? '{}';
-      const cleaned = raw.replace(/```json|```/g, '').trim();
+      const data = (await res.json()) as any;
+      const raw = data.choices?.[0]?.message?.content ?? "{}";
+      const cleaned = raw.replace(/```json|```/g, "").trim();
       return JSON.parse(cleaned) as EvaluationResult;
-
     } catch (err) {
-      console.error('Evaluation failed:', err);
+      console.error("Evaluation failed:", err);
       return this.fallbackEval();
     } finally {
       this.isLoading.set(false);
@@ -485,11 +510,14 @@ Respond only with the question or follow-up. No meta-commentary.`;
 
   private fallbackEval(): EvaluationResult {
     return {
-      overallScore: 70, technicalScore: 70,
-      communicationScore: 70, confidenceScore: 70,
-      strengths:    ['Completed the interview', 'Provided responses'],
-      improvements: ['Evaluation API error — could not score'],
-      summary: 'Interview completed. Evaluation unavailable due to a technical issue.',
+      overallScore: 70,
+      technicalScore: 70,
+      communicationScore: 70,
+      confidenceScore: 70,
+      strengths: ["Completed the interview", "Provided responses"],
+      improvements: ["Evaluation API error — could not score"],
+      summary:
+        "Interview completed. Evaluation unavailable due to a technical issue.",
     };
   }
 

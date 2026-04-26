@@ -18,33 +18,41 @@
  */
 
 class VADProcessor extends AudioWorkletProcessor {
-
   constructor() {
     super();
+    this._muted = false; // ← ADD
 
+    // ← ADD: listen for mute commands from main thread
+    this.port.onmessage = (e) => {
+      if (e.data && e.data.muted !== undefined) {
+        this._muted = e.data.muted;
+        if (this._muted) this._envelope = 0; // drain envelope immediately
+      }
+    };
     // ── Envelope follower coefficients ────────────────────────
     // Attack: how fast level rises when voice starts (fast = responsive)
     // Release: how fast level falls when voice stops (SLOW = patience)
     // At 16kHz, 128 samples = 8ms per frame
     // attackCoeff  = 1 - e^(-1 / (attackMs  / 8)) ≈ fast rise
     // releaseCoeff = 1 - e^(-1 / (releaseMs / 8)) ≈ slow fall
-    this._attackCoeff  = 0.40;   // ~20ms attack  — snappy voice detection
-    this._releaseCoeff = 0.012;  // ~580ms release — holds level through breaths
+    this._attackCoeff = 0.4; // ~20ms attack  — snappy voice detection
+    this._releaseCoeff = 0.012; // ~580ms release — holds level through breaths
 
-    this._envelope = 0;          // Current smoothed envelope value (0–1)
-    this._frameCount = 0;        // Total frames processed
-    this._reportEvery = 4;       // Post to main thread every 4 frames (~32ms)
+    this._envelope = 0; // Current smoothed envelope value (0–1)
+    this._frameCount = 0; // Total frames processed
+    this._reportEvery = 4; // Post to main thread every 4 frames (~32ms)
 
     // Speech/silence thresholds (normalised 0–1 RMS)
     // These are intentionally asymmetric (hysteresis):
     //   - Need higher level to START speaking detection
     //   - Need lower level to STOP (prevents rapid on/off toggling)
-    this._onThreshold  = 0.018;  // RMS above this → speech
-    this._offThreshold = 0.008;  // RMS below this → silence
+    this._onThreshold = 0.018; // RMS above this → speech
+    this._offThreshold = 0.008; // RMS below this → silence
     this._isSpeech = false;
   }
 
   process(inputs) {
+    if (this._muted) return true;
     const input = inputs[0];
     if (!input || !input[0]) return true;
 
@@ -62,7 +70,7 @@ class VADProcessor extends AudioWorkletProcessor {
     // This means: if you take a breath mid-sentence, the envelope
     // stays elevated for ~580ms before dropping to silence level
     if (rms > this._envelope) {
-      this._envelope += this._attackCoeff  * (rms - this._envelope);
+      this._envelope += this._attackCoeff * (rms - this._envelope);
     } else {
       this._envelope += this._releaseCoeff * (rms - this._envelope);
     }
@@ -79,9 +87,9 @@ class VADProcessor extends AudioWorkletProcessor {
     this._frameCount++;
     if (this._frameCount % this._reportEvery === 0) {
       this.port.postMessage({
-        rms:         rms,
-        envelope:    this._envelope,
-        isSpeech:    this._isSpeech,
+        rms: rms,
+        envelope: this._envelope,
+        isSpeech: this._isSpeech,
       });
     }
 
@@ -89,4 +97,4 @@ class VADProcessor extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor('vad-processor', VADProcessor);
+registerProcessor("vad-processor", VADProcessor);
