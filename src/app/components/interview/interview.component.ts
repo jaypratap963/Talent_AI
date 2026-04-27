@@ -1,19 +1,3 @@
-// ─────────────────────────────────────────────────────────────────
-// components/interview/interview.component.ts
-//
-// Single service source: SpeechService only.
-// StreamingSpeechService removed — it was the root cause of the bug.
-//
-// FLOW:
-//   VAD commits → SpeechService.processRecording()
-//     → Whisper returns real transcript
-//     → analysisComplete$ → interview.setLastAnalysis()
-//     → transcriptComplete$ → submitAnswer()
-//     → interview.sendAIMessage()
-//       → filler clip + GPT stream + sentence TTS queue
-//       → onEnd callback → scheduleAutoMic()
-// ─────────────────────────────────────────────────────────────────
-
 import {
   Component, OnInit, OnDestroy, inject, signal, computed
 } from '@angular/core';
@@ -22,6 +6,7 @@ import { FormsModule } from '@angular/forms';
 import { Subscription } from 'rxjs';
 
 import { InterviewService } from '../../services/interview.service';
+import { RealtimeService } from '../../services/realtime.service';
 import { SpeechService } from '../../services/speech.service';
 import { AiService } from '../../services/ai.service';
 import { ChatWindowComponent } from '../chat-window/chat-window.component';
@@ -36,178 +21,156 @@ import { ChatWindowComponent } from '../chat-window/chat-window.component';
 export class InterviewComponent implements OnInit, OnDestroy {
 
   interview = inject(InterviewService);
+  realtime  = inject(RealtimeService);
   speech    = inject(SpeechService);
   ai        = inject(AiService);
 
+  // ── UI state ──────────────────────────────────
   textInput      = signal('');
   demoMode       = signal(false);
   showEvaluation = signal(false);
   isStarted      = signal(false);
   showTextInput  = signal(false);
-  isStreaming    = signal(false);
+  isConnecting   = signal(false);
 
-  messages    = computed(() => this.interview.chatHistory());
-  isActive    = computed(() => this.interview.isActive());
-  isCompleted = computed(() => this.interview.isCompleted());
-  isLoading   = computed(() => this.ai.isLoading());
-  isTyping    = computed(() => this.interview.isTyping());
-  evaluation  = computed(() => this.interview.session().evaluation);
-  questionNum = computed(() => this.interview.questionCount());
-  currentQ    = computed(() => this.interview.session().currentQuestion);
-  phase       = computed(() => this.speech.phase());
-  isSpeaking  = computed(() => this.speech.isSpeaking());
-  isListening = computed(() => this.speech.isListening());
-  // liveText shows VAD status ("🎙 Recording...") not the transcript
-  // The real transcript only appears after Whisper returns
-  liveText    = computed(() => this.speech.transcript());
-  recordingMs = computed(() => this.speech.recordingMs());
+  // ── Derived from interview service ────────────
+  messages      = computed(() => this.interview.chatHistory());
+  isActive      = computed(() => this.interview.isActive());
+  isCompleted   = computed(() => this.interview.isCompleted());
+  isLoading     = computed(() => this.ai.isLoading());
+  isTyping      = computed(() => this.interview.isTyping());
+  evaluation    = computed(() => this.interview.session().evaluation);
+  questionNum   = computed(() => this.interview.questionCount());
+  currentQ      = computed(() => this.interview.session().currentQuestion);
 
+  // ── Derived from realtime service ─────────────
+  phase          = computed(() => this.realtime.phase());
+  isSpeaking     = computed(() => this.realtime.isSpeaking());
+  // isListening = mic is active (replaces old speech.isListening signal)
+  isListening    = computed(() => this.realtime.isMicActive());
+  // liveText = what VAD is showing / user transcript
+  liveText       = computed(() => this.realtime.userTranscript());
+  // sttSupported = mic API available
+  readonly sttSupported = !!(navigator.mediaDevices?.getUserMedia);
+
+  // ── Avatar status label ───────────────────────
   statusLabel = computed<string>(() => {
     if (!this.isStarted()) return '';
-    if (this.isStreaming())                   return 'Alex is thinking...';
-    if (this.isTyping() || this.isLoading())  return 'Thinking...';
+    if (this.isConnecting()) return 'Connecting to Alex...';
     switch (this.phase()) {
-      case 'ai-speaking':   return 'Alex is speaking...';
-      case 'listening':     return 'Listening for your voice...';
+      case 'connecting':    return 'Setting up interview...';
+      case 'ready':         return 'Your turn to speak';
       case 'user-speaking': return "I'm listening...";
-      case 'filler-pause':  return 'Take your time...';
-      case 'processing':    return 'Processing your answer...';
+      case 'user-done':     return 'Processing...';
+      case 'processing':    return 'Alex is thinking...';
+      case 'alex-speaking': return 'Alex is speaking...';
+      case 'error':         return this.realtime.error() || 'Connection error';
       default:              return this.isActive() ? 'Your turn to speak' : '';
     }
   });
 
+  // ── Avatar animation class ────────────────────
   avatarState = computed<string>(() => {
-    if (this.isStreaming())                   return 'thinking';
-    if (this.isTyping() || this.isLoading())  return 'thinking';
+    if (this.isConnecting() || this.phase() === 'connecting') return 'thinking';
     switch (this.phase()) {
-      case 'ai-speaking':   return 'speaking';
       case 'user-speaking': return 'listening';
-      case 'filler-pause':  return 'patient';
-      case 'processing':    return 'processing';
-      default:              return 'idle';
+      case 'user-done':
+      case 'processing':    return 'thinking';
+      case 'alex-speaking': return 'speaking';
+      default:
+        // Demo / non-realtime fallback
+        if (this.isTyping() || this.isLoading()) return 'thinking';
+        if (this.speech.isSpeaking()) return 'speaking';
+        if (this.speech.phase() === 'user-speaking') return 'listening';
+        return 'idle';
     }
   });
 
-  recordingLabel = computed<string>(() => {
-    const ms = this.recordingMs();
-    if (!ms || ms < 500) return '';
-    const s = Math.floor(ms / 1000);
-    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-  });
-
   private subs = new Subscription();
-  private micOpenCheck: ReturnType<typeof setInterval> | null = null;
 
   ngOnInit(): void {
     this.demoMode.set(!this.ai.hasApiKey());
 
-    // 1. Analysis arrives first — store it before transcript fires
+    // ── Realtime mode subscriptions ───────────────
+    // 1. User transcript → store in chat history
     this.subs.add(
-      this.speech.analysisComplete$.subscribe(analysis => {
-        this.interview.setLastAnalysis(analysis);
+      this.realtime.userTranscript$.subscribe(transcript => {
+        this.interview.addUserMessage(transcript);
+
+        // Check if 8 questions answered → end interview
+        if (this.interview.questionCount() >= 8) {
+          this.endEarly();
+        }
       })
     );
 
-    // 2. Whisper transcript ready — submit as answer
+    // 2. Alex's response text → store in chat history
+    this.subs.add(
+      this.realtime.responseText$.subscribe(text => {
+        this.interview.addAlexMessage(text);
+        // Update question count in backend prompt
+        this.realtime.updateQuestionCount(this.interview.questionCount());
+      })
+    );
+
+    // ── Demo / non-realtime mode subscription ─────
+    // 3. Old-style STT transcript (demo mode only)
     this.subs.add(
       this.speech.transcriptComplete$.subscribe(text => {
-        // Guard: ignore status strings that slipped through
-        // (shouldn't happen now, but safety net)
-        const isStatusText = ['🎙 Recording...', 'Transcribing...', 'Processing...', 'Take your time...', 'Listening...'].includes(text);
-        if (isStatusText) return;
-
+        if (!this.demoMode()) return; // Only handle in demo mode
         this.textInput.set(text);
         this.submitAnswer();
-      })
-    );
-
-    // 3. GPT streaming token → animate avatar immediately
-    this.subs.add(
-      this.ai.streamToken$.subscribe(() => {
-        if (!this.isStreaming()) this.isStreaming.set(true);
-      })
-    );
-
-    // 4. GPT response assembled → stop streaming indicator
-    this.subs.add(
-      this.ai.responseComplete$.subscribe(() => {
-        this.isStreaming.set(false);
       })
     );
   }
 
   ngOnDestroy(): void {
     this.subs.unsubscribe();
-    this.clearMicCheck();
-    this.ai.stopAudio();
+    this.realtime.disconnect();
     this.speech.stopSpeaking();
     this.speech.stopListening();
   }
 
-  // ── Interview lifecycle ────────────────────────────────────────
+  // ── Interview lifecycle ────────────────────────
 
   async startInterview(): Promise<void> {
     this.isStarted.set(true);
-    await this.interview.startInterview(this.demoMode());
-    this.scheduleAutoMic();
-  }
 
-  async submitAnswer(): Promise<void> {
-    const text = this.textInput().trim();
-    if (!text || this.isLoading() || this.isTyping()) return;
-
-    // Final guard against status strings
-    const junkStrings = ['🎙 Recording...', 'Transcribing...', 'Processing your answer...', 'Listening...', 'Take your time...', '[Demo mode — type your answer instead]'];
-    if (junkStrings.some(j => text.includes(j))) {
-      this.textInput.set('');
+    if (this.demoMode()) {
+      // Demo: use old pipeline (no backend needed)
+      await this.interview.startInterview(true);
       return;
     }
 
+    // Realtime mode
+    this.isConnecting.set(true);
+    try {
+      const resume     = this.interview.session().resumeData;
+      const resumeText = resume?.rawText  ?? '';
+      const skills     = resume?.skills?.join(', ') ?? '';
+
+      await this.realtime.connect(resumeText, skills);
+      await this.realtime.startMic();
+      this.interview.markActive();
+      this.isConnecting.set(false);
+    } catch (err: any) {
+      this.isConnecting.set(false);
+      this.realtime.error.set(err.message || 'Failed to connect to backend');
+    }
+  }
+
+  // Used in demo mode and text input fallback
+  async submitAnswer(): Promise<void> {
+    const text = this.textInput().trim();
+    if (!text || this.isLoading() || this.isTyping()) return;
     this.textInput.set('');
-    this.ai.stopAudio();
-    this.speech.stopSpeaking();
 
-    await this.interview.submitUserAnswer(text, this.demoMode());
-    this.scheduleAutoMic();
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // AUTO MIC OPEN
-  // Waits until Alex finishes speaking AND phase returns to idle,
-  // then opens mic. The 150ms polling is fine — it only runs for
-  // at most the duration of Alex's response (~5-15s).
-  // ─────────────────────────────────────────────────────────────
-
-  private scheduleAutoMic(): void {
-    if (!this.speech.sttSupported) return;
-    this.clearMicCheck();
-
-    this.micOpenCheck = setInterval(() => {
-      const ready =
-        !this.isSpeaking()   &&
-        !this.isStreaming()  &&
-        !this.isTyping()     &&
-        !this.isLoading()    &&
-        this.phase() === 'idle' &&
-        this.isActive();
-
-      if (ready) {
-        this.clearMicCheck();
-        setTimeout(() => {
-          if (this.isActive() && !this.isListening()) {
-            this.speech.startListening();
-          }
-        }, 500); // 500ms buffer after audio clears
-      }
-    }, 150);
-
-    setTimeout(() => this.clearMicCheck(), 60000);
-  }
-
-  private clearMicCheck(): void {
-    if (this.micOpenCheck) {
-      clearInterval(this.micOpenCheck);
-      this.micOpenCheck = null;
+    if (this.demoMode()) {
+      this.speech.stopSpeaking();
+      await this.interview.submitUserAnswer(text, true);
+    } else {
+      // Realtime mode: inject typed text as user turn
+      this.interview.addUserMessage(text);
     }
   }
 
@@ -218,45 +181,54 @@ export class InterviewComponent implements OnInit, OnDestroy {
     }
   }
 
+  // Mic toggle for manual control
   toggleListening(): void {
-    if (this.isListening()) {
-      this.speech.stopListening();
-    } else {
-      this.ai.stopAudio();
-      this.speech.stopSpeaking();
-      this.speech.startListening();
+    if (this.demoMode()) {
+      if (this.speech.isListening()) {
+        this.speech.stopListening();
+      } else {
+        this.speech.stopSpeaking();
+        this.speech.startListening();
+      }
     }
+    // In realtime mode mic is always-on — button is hidden
   }
 
+  // Stop Alex mid-sentence
   stopSpeaking(): void {
-    this.ai.stopAudio();
-    this.speech.stopSpeaking();
-    if (this.speech.sttSupported && this.isActive()) {
-      setTimeout(() => {
-        if (!this.isListening()) this.speech.startListening();
-      }, 300);
+    if (this.demoMode()) {
+      this.speech.stopSpeaking();
+    } else {
+      // Interrupt realtime audio
+      (this.realtime as any).stopAlexAudio();
     }
   }
 
-  toggleTextInput(): void { this.showTextInput.update(v => !v); }
+  toggleTextInput(): void {
+    this.showTextInput.update(v => !v);
+  }
 
   async endEarly(): Promise<void> {
-    this.clearMicCheck();
-    this.speech.stopListening();
+    if (!this.demoMode()) {
+      this.realtime.stopMic();
+    } else {
+      this.speech.stopListening();
+    }
     await this.interview.endInterview(this.demoMode());
+    // Speak closing via regular TTS
+    this.speech.speak("That wraps up our interview. Thank you for your time. Let me prepare your evaluation.");
   }
 
   viewEvaluation():  void { this.showEvaluation.set(true); }
   hideEvaluation():  void { this.showEvaluation.set(false); }
 
   restartInterview(): void {
-    this.clearMicCheck();
-    this.ai.stopAudio();
+    this.realtime.disconnect();
     this.speech.stopSpeaking();
     this.speech.stopListening();
     this.interview.resetSession();
     this.isStarted.set(false);
-    this.isStreaming.set(false);
+    this.isConnecting.set(false);
     this.showEvaluation.set(false);
     this.textInput.set('');
   }
