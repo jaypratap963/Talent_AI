@@ -21,59 +21,61 @@
 //   responseTextDelta$  → streaming tokens (for live text display)
 // ─────────────────────────────────────────────────────────────────
 
-import { Injectable, signal, NgZone } from '@angular/core';
-import { Subject } from 'rxjs';
+import { Injectable, signal, NgZone } from "@angular/core";
+import { Subject } from "rxjs";
 
 export type RealtimePhase =
-  | 'idle'
-  | 'connecting'
-  | 'ready'           // connected, waiting for user
-  | 'user-speaking'   // VAD detected speech
-  | 'user-done'       // VAD detected end of speech
-  | 'processing'      // OpenAI processing the audio
-  | 'alex-speaking'   // Alex's audio is playing
-  | 'error';
+  | "idle"
+  | "connecting"
+  | "ready" // connected, waiting for user
+  | "user-speaking" // VAD detected speech
+  | "user-done" // VAD detected end of speech
+  | "processing" // OpenAI processing the audio
+  | "alex-speaking" // Alex's audio is playing
+  | "error";
 
-@Injectable({ providedIn: 'root' })
+@Injectable({ providedIn: "root" })
 export class RealtimeService {
-
   // ── Public signals (drive UI) ─────────────────────────────────
-  phase           = signal<RealtimePhase>('idle');
-  isConnected     = signal(false);
-  isMicActive     = signal(false);
-  isSpeaking      = signal(false);   // Alex is speaking
-  userTranscript  = signal('');      // live transcript of user speech
-  alexText        = signal('');      // streaming Alex response text
-  error           = signal<string | null>(null);
+  phase = signal<RealtimePhase>("idle");
+  isConnected = signal(false);
+  isMicActive = signal(false);
+  isSpeaking = signal(false); // Alex is speaking
+  userTranscript = signal(""); // live transcript of user speech
+  alexText = signal(""); // streaming Alex response text
+  error = signal<string | null>(null);
 
   // ── Output subjects ───────────────────────────────────────────
   // userTranscript$ — fires once per complete user turn
-  userTranscript$     = new Subject<string>();
+  userTranscript$ = new Subject<string>();
   // responseText$ — fires once Alex's full response is ready
-  responseText$       = new Subject<string>();
+  responseText$ = new Subject<string>();
   // responseTextDelta$ — fires per token for streaming display
-  responseTextDelta$  = new Subject<string>();
+  responseTextDelta$ = new Subject<string>();
   // sessionReady$ — fires when OpenAI session is configured
-  sessionReady$       = new Subject<void>();
+  sessionReady$ = new Subject<void>();
 
   // ── Private ───────────────────────────────────────────────────
   private ws: WebSocket | null = null;
-  private backendUrl = 'ws://localhost:3001';
+  private backendUrl = "ws://localhost:3001";
 
   // Mic / audio input
-  private audioCtx:    AudioContext | null = null;
-  private micStream:   MediaStream  | null = null;
-  private scriptProc:  ScriptProcessorNode | null = null;
-  private sourceNode:  MediaStreamAudioSourceNode | null = null;
+  private audioCtx: AudioContext | null = null;
+  private micStream: MediaStream | null = null;
+  private scriptProc: ScriptProcessorNode | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
 
-  // Audio output queue — plays Alex's voice gaplessly
-  private playCtx:     AudioContext | null = null;
-  private playNextAt   = 0;      // scheduled time for next audio chunk
-  private audioQueue:  AudioBuffer[] = [];
-  private isPlaying    = false;
+  // Audio output — plays Alex's voice gaplessly
+  private playCtx: AudioContext | null = null;
+  private playNextAt = 0;
+  private activeBuffers = 0; // buffers scheduled but not finished
+  private audioStreamDone = false; // true after response_audio_done
+  // Mic gate: while true, zero bytes are sent to OpenAI.
+  // Prevents Alex's speaker output triggering server_vad as user speech.
+  private micSuspended = false;
 
   // Accumulated response text for current turn
-  private currentResponseText = '';
+  private currentResponseText = "";
 
   constructor(private ngZone: NgZone) {}
 
@@ -85,15 +87,15 @@ export class RealtimeService {
   async connect(resumeText: string, skills: string): Promise<void> {
     if (this.isConnected()) return;
 
-    this.phase.set('connecting');
+    this.phase.set("connecting");
     this.error.set(null);
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.backendUrl);
-      this.ws.binaryType = 'arraybuffer';
+      this.ws.binaryType = "arraybuffer";
 
       const timeout = setTimeout(() => {
-        reject(new Error('Connection timeout. Is the backend running?'));
+        reject(new Error("Connection timeout. Is the backend running?"));
         this.ws?.close();
       }, 8000);
 
@@ -101,12 +103,14 @@ export class RealtimeService {
         clearTimeout(timeout);
 
         // Send resume context — backend uses this for the system prompt
-        this.ws!.send(JSON.stringify({
-          type:       'init',
-          resumeText: resumeText,
-          skills:     skills,
-          questionCount: 0,
-        }));
+        this.ws!.send(
+          JSON.stringify({
+            type: "init",
+            resumeText: resumeText,
+            skills: skills,
+            questionCount: 0,
+          }),
+        );
       };
 
       this.ws.onmessage = (event) => {
@@ -116,18 +120,20 @@ export class RealtimeService {
       this.ws.onerror = (e) => {
         clearTimeout(timeout);
         this.ngZone.run(() => {
-          this.error.set('Cannot connect to backend. Run: cd backend && node server.js');
-          this.phase.set('error');
+          this.error.set(
+            "Cannot connect to backend. Run: cd backend && node server.js",
+          );
+          this.phase.set("error");
         });
-        reject(new Error('WebSocket connection failed'));
+        reject(new Error("WebSocket connection failed"));
       };
 
       this.ws.onclose = () => {
         this.ngZone.run(() => {
           this.isConnected.set(false);
           this.isMicActive.set(false);
-          if (this.phase() !== 'idle') {
-            this.phase.set('idle');
+          if (this.phase() !== "idle") {
+            this.phase.set("idle");
           }
         });
       };
@@ -154,39 +160,42 @@ export class RealtimeService {
     }
 
     switch (msg.type) {
-
       // ── Session ready ───────────────────────────────────────
-      case 'ready':
+      case "ready":
         this.isConnected.set(true);
-        this.phase.set('ready');
+        this.phase.set("ready");
         this.sessionReady$.next();
         break;
 
-      // ── OpenAI VAD: user started speaking ──────────────────
-      // This fires the INSTANT OpenAI detects voice — ~100ms latency
-      case 'user_speech_start':
-        this.phase.set('user-speaking');
-        this.userTranscript.set('');
-        // If Alex was speaking, stop playback (user is interrupting)
-        this.stopAlexAudio();
+      case "user_speech_start":
+        // If mic is suspended Alex is still playing — ignore bleed-through.
+        if (this.micSuspended) break;
+        // DO NOT stop Alex's audio here. user_speech_start fires the instant
+        // VAD hears any sound — a breath, a filler, even room noise.
+        // We only act on committed audio (user_audio_committed below).
+        this.phase.set("user-speaking");
+        this.userTranscript.set("");
         break;
 
-      // ── OpenAI VAD: user stopped speaking ──────────────────
-      // Fires when 800ms of silence detected after speech
-      case 'user_speech_stop':
-        this.phase.set('user-done');
+      case "user_speech_stop":
+        if (this.micSuspended) break;
+        this.phase.set("user-done");
         break;
 
-      // ── Audio committed for transcription ──────────────────
       case 'user_audio_committed':
-        this.phase.set('processing');
-        break;
+  if (this.micSuspended) break;
+  // NOW stop Alex if somehow still playing — user has actually finished
+  // a real utterance (VAD confirmed full speech + silence window).
+  this.stopAlexAudio();
+  this.phase.set('processing');
+  break;
 
-      // ── Complete transcript of what user said ───────────────
-      // This is the ACCURATE transcript from Whisper
-      // Only fires ONCE per complete utterance
-      case 'user_transcript':
-        const transcript = msg.transcript?.trim() ?? '';
+      // ── Transcript of what user said ────────────────────────
+      case "user_transcript":
+        // Discard if mic was suspended — this is Alex's own voice
+        // that leaked into the mic and was transcribed as user input.
+        if (this.micSuspended) break;
+        const transcript = msg.transcript?.trim() ?? "";
         if (transcript) {
           this.userTranscript.set(transcript);
           this.userTranscript$.next(transcript);
@@ -194,21 +203,24 @@ export class RealtimeService {
         break;
 
       // ── Alex's response is being generated ─────────────────
-      case 'response_started':
-        this.currentResponseText = '';
-        this.alexText.set('');
-        this.phase.set('processing');
+      case "response_started":
+        this.currentResponseText = "";
+        this.alexText.set("");
+        this.audioStreamDone = false;
+        this.activeBuffers = 0;
+        this.micSuspended = true; // stop mic BEFORE first audio chunk
+        this.phase.set("processing");
         break;
 
       // ── Streaming text token from Alex ──────────────────────
-      case 'response_text_delta':
+      case "response_text_delta":
         this.currentResponseText += msg.delta;
         this.alexText.set(this.currentResponseText);
         this.responseTextDelta$.next(msg.delta);
         break;
 
       // ── Alex's full text response complete ──────────────────
-      case 'response_text_done':
+      case "response_text_done":
         this.currentResponseText = msg.text || this.currentResponseText;
         this.alexText.set(this.currentResponseText);
         this.responseText$.next(this.currentResponseText);
@@ -217,31 +229,34 @@ export class RealtimeService {
       // ── Alex's audio chunk (PCM16 base64) ──────────────────
       // This fires ~30 times per second while Alex speaks
       // We decode and queue each chunk for gapless playback
-      case 'response_audio_delta':
+      case "response_audio_delta":
         this.playAudioChunk(msg.delta);
         break;
 
       // ── Alex's audio stream complete ────────────────────────
-      case 'response_audio_done':
-        // Don't change phase yet — let the queued audio finish playing
-        // playback completion handler sets phase back to 'ready'
+      case "response_audio_done":
+        this.audioStreamDone = true;
+        // If all buffers already finished before this event arrived, finish now
+        if (this.activeBuffers === 0) {
+          this.onAlexFinished();
+        }
         break;
 
       // ── Full response complete ───────────────────────────────
-      case 'response_done':
+      case "response_done":
         // Phase transitions to ready after audio finishes
         // (handled in schedulePlayback via isPlaying flag)
         break;
 
       // ── Error ───────────────────────────────────────────────
-      case 'error':
-        this.error.set(msg.message || 'Realtime API error');
-        this.phase.set('error');
+      case "error":
+        this.error.set(msg.message || "Realtime API error");
+        this.phase.set("error");
         break;
 
-      case 'disconnected':
+      case "disconnected":
         this.isConnected.set(false);
-        this.phase.set('idle');
+        this.phase.set("idle");
         break;
     }
   }
@@ -258,21 +273,21 @@ export class RealtimeService {
     try {
       this.micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation:  true,
-          noiseSuppression:  true,
-          autoGainControl:   true,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
           // 24kHz matches OpenAI Realtime input format
-          sampleRate:        24000,
-          channelCount:      1,
+          sampleRate: 24000,
+          channelCount: 1,
         },
       });
     } catch {
-      this.error.set('Microphone permission denied.');
+      this.error.set("Microphone permission denied.");
       return;
     }
 
     // AudioContext at 24kHz for PCM16 conversion
-    this.audioCtx   = new AudioContext({ sampleRate: 24000 });
+    this.audioCtx = new AudioContext({ sampleRate: 24000 });
     this.sourceNode = this.audioCtx.createMediaStreamSource(this.micStream);
 
     // ScriptProcessor: reads raw float32 samples, converts to PCM16 int16
@@ -280,10 +295,15 @@ export class RealtimeService {
     this.scriptProc = this.audioCtx.createScriptProcessor(4096, 1, 1);
 
     this.scriptProc.onaudioprocess = (e) => {
+      // THE CORE FIX: while Alex is speaking, send nothing to OpenAI.
+      // Without this, Alex's speaker output bleeds into the mic,
+      // OpenAI's VAD commits it as user speech, and the transcript
+      // triggers a new response that cuts Alex off mid-sentence.
+      if (this.micSuspended) return;
       if (!this.isConnected() || this.ws?.readyState !== WebSocket.OPEN) return;
 
       const float32 = e.inputBuffer.getChannelData(0);
-      const pcm16   = this.float32ToPCM16(float32);
+      const pcm16 = this.float32ToPCM16(float32);
 
       // Send as binary — backend detects binary and forwards as audio
       this.ws!.send(pcm16.buffer);
@@ -303,7 +323,7 @@ export class RealtimeService {
     this.scriptProc = null;
     this.sourceNode = null;
 
-    this.micStream?.getTracks().forEach(t => t.stop());
+    this.micStream?.getTracks().forEach((t) => t.stop());
     this.micStream = null;
 
     this.audioCtx?.close().catch(() => {});
@@ -323,9 +343,10 @@ export class RealtimeService {
     for (let i = 0; i < float32.length; i++) {
       // Clamp to -1..1, scale to int16 range
       const clamped = Math.max(-1, Math.min(1, float32[i]));
-      int16[i] = clamped < 0
-        ? clamped * 32768   // negative: multiply by 32768
-        : clamped * 32767;  // positive: multiply by 32767 (avoid overflow)
+      int16[i] =
+        clamped < 0
+          ? clamped * 32768 // negative: multiply by 32768
+          : clamped * 32767; // positive: multiply by 32767 (avoid overflow)
     }
     return int16;
   }
@@ -339,72 +360,81 @@ export class RealtimeService {
   // zero gap and no dropouts.
   // ─────────────────────────────────────────────────────────────
 
-  private async playAudioChunk(base64: string): Promise<void> {
+  private playAudioChunk(base64: string): void {
     if (!base64) return;
 
-    // Initialize playback AudioContext (24kHz matches output format)
     if (!this.playCtx) {
-      this.playCtx  = new AudioContext({ sampleRate: 24000 });
+      this.playCtx = new AudioContext({ sampleRate: 24000 });
       this.playNextAt = this.playCtx.currentTime;
     }
 
-    // Decode base64 → binary → PCM16 int16 → float32
-    const binary  = atob(base64);
-    const bytes   = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
+    // Synchronous decode — NO async/await here.
+    // async causes microtask delays between chunks which lets
+    // AudioContext.currentTime drift past playNextAt, creating
+    // audible gaps (the "stuttering mid-sentence" bug).
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
 
-    // PCM16 = 2 bytes per sample (little-endian int16)
-    const int16   = new Int16Array(bytes.buffer);
+    const int16 = new Int16Array(bytes.buffer);
     const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 32768; // normalize to -1..1
-    }
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
-    // Create AudioBuffer
-    const buffer  = this.playCtx.createBuffer(1, float32.length, 24000);
+    const buffer = this.playCtx.createBuffer(1, float32.length, 24000);
     buffer.copyToChannel(float32, 0);
 
-    // Schedule on AudioContext timeline for gapless playback
-    const source  = this.playCtx.createBufferSource();
+    const source = this.playCtx.createBufferSource();
     source.buffer = buffer;
     source.connect(this.playCtx.destination);
 
     const startAt = Math.max(this.playNextAt, this.playCtx.currentTime);
     source.start(startAt);
-
-    // Advance the schedule pointer
     this.playNextAt = startAt + buffer.duration;
 
-    // Track speaking state
+    this.activeBuffers++;
+
+    // Update Angular signals only on the FIRST chunk of each turn.
+    // Calling ngZone.run() on every chunk triggers change detection
+    // (~10ms each) which causes the same currentTime drift / gap bug.
     if (!this.isSpeaking()) {
       this.ngZone.run(() => {
         this.isSpeaking.set(true);
-        this.phase.set('alex-speaking');
+        this.phase.set("alex-speaking");
       });
     }
 
-    // Detect when this chunk is the last playing (no new chunks for 300ms)
     source.onended = () => {
-      // Check if there's another chunk scheduled after this one
-      if (this.playCtx && this.playNextAt <= this.playCtx.currentTime + 0.05) {
-        // Nothing scheduled — Alex finished speaking
-        this.ngZone.run(() => {
-          this.isSpeaking.set(false);
-          this.phase.set('ready');
-        });
+      this.activeBuffers--;
+      // Declare Alex done only when:
+      // 1. OpenAI confirmed all chunks sent (audioStreamDone)
+      // 2. Every scheduled buffer has finished playing (activeBuffers === 0)
+      if (this.audioStreamDone && this.activeBuffers === 0) {
+        this.onAlexFinished();
       }
     };
   }
 
+  // Called exactly once when all of Alex's audio has finished playing.
+  private onAlexFinished(): void {
+    this.micSuspended = false; // resume mic — user can now speak
+    this.audioStreamDone = false;
+    this.activeBuffers = 0;
+    this.ngZone.run(() => {
+      this.isSpeaking.set(false);
+      this.phase.set("ready");
+    });
+  }
+
   private stopAlexAudio(): void {
-    // Close and recreate the playback context to stop all audio immediately
     if (this.playCtx) {
       this.playCtx.close().catch(() => {});
-      this.playCtx  = null;
+      this.playCtx = null;
       this.playNextAt = 0;
     }
+    this.activeBuffers = 0;
+    this.audioStreamDone = false;
+    this.micSuspended = false;
     this.isSpeaking.set(false);
   }
 
@@ -415,7 +445,7 @@ export class RealtimeService {
 
   manualCommit(): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'commit_audio' }));
+      this.ws.send(JSON.stringify({ type: "commit_audio" }));
     }
   }
 
@@ -427,10 +457,12 @@ export class RealtimeService {
 
   updateQuestionCount(count: number): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type:          'update_session',
-        questionCount: count,
-      }));
+      this.ws.send(
+        JSON.stringify({
+          type: "update_session",
+          questionCount: count,
+        }),
+      );
     }
   }
 
@@ -446,6 +478,6 @@ export class RealtimeService {
     this.isConnected.set(false);
     this.isMicActive.set(false);
     this.isSpeaking.set(false);
-    this.phase.set('idle');
+    this.phase.set("idle");
   }
 }

@@ -89,7 +89,7 @@ export class InterviewComponent implements OnInit, OnDestroy {
   private subs = new Subscription();
 
   ngOnInit(): void {
-    this.demoMode.set(!this.ai.hasApiKey());
+    this.demoMode.set(false);
 
     // ── Realtime mode subscriptions ───────────────
     // 1. User transcript → store in chat history

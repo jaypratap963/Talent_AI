@@ -11,7 +11,6 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ResumeParserService } from '../../services/resume-parser.service';
 import { InterviewService } from '../../services/interview.service';
-import { AiService } from '../../services/ai.service';
 import { ResumeData } from '../../models/interview.models';
 
 @Component({
@@ -27,15 +26,13 @@ export class ResumeUploadComponent {
 
   private parser    = inject(ResumeParserService);
   private interview = inject(InterviewService);
-  private aiService = inject(AiService);
 
   // ── Component State ───────────────────────────
   isDragOver   = signal(false);
   isProcessing = signal(false);
   errorMsg     = signal<string | null>(null);
   resume       = signal<ResumeData | null>(null);
-  apiKey       = signal('');
-  demoMode     = signal(false);
+
 
   // ── Drag and Drop ─────────────────────────────
 
@@ -83,24 +80,12 @@ export class ResumeUploadComponent {
 
   // ── Configuration ─────────────────────────────
 
-  /** User enters their OpenAI key; stored in memory only */
-  onApiKeyChange(value: string): void {
-    this.apiKey.set(value);
-    this.aiService.setApiKey(value);
-  }
-
   /** Proceed to interview with either real AI or demo mode */
   startInterview(): void {
-    if (!this.resume()) return;
-    this.resumeReady.emit(this.resume()!);
-  }
-
-  toggleDemoMode(): void {
-    this.demoMode.update(v => !v);
-    if (this.demoMode()) {
-      this.apiKey.set('');
-    }
-  }
+  if (!this.resume()) return;
+  this.resumeReady.emit(this.resume()!);
+  // No API key needed — backend uses .env key directly
+}
 
   removeResume(): void {
     this.resume.set(null);

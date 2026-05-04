@@ -72,48 +72,12 @@
       }
     </div>
 
-    <!-- Step 2: API Key or Demo Mode -->
-    <div class="step" [class.step-disabled]="!resume()">
-      <div class="step-label"><span class="step-num">02</span> Connect AI</div>
-
-      <div class="mode-toggle">
-        <button
-          class="mode-btn"
-          [class.active]="!demoMode()"
-          (click)="demoMode() && toggleDemoMode()"
-        >🔑 OpenAI API</button>
-        <button
-          class="mode-btn"
-          [class.active]="demoMode()"
-          (click)="!demoMode() && toggleDemoMode()"
-        >🎮 Demo Mode</button>
-      </div>
-
-      @if (!demoMode()) {
-        <input
-          type="password"
-          class="api-input"
-          placeholder="sk-proj-..."
-          [value]="apiKey()"
-          (input)="onApiKeyChange($any($event.target).value)"
-          [disabled]="!resume()"
-        >
-        <p class="api-note">🔒 Key is stored in memory only — never sent anywhere except OpenAI.</p>
-      } @else {
-        <div class="demo-notice">
-          <span>🎮</span>
-          <div>
-            <strong>Demo Mode Active</strong>
-            <p>Pre-written questions will be used. No API key needed.</p>
-          </div>
-        </div>
-      }
-    </div>
+   
 
     <!-- Start Button -->
     <button
       class="start-btn"
-      [disabled]="!resume() || (!demoMode() && !apiKey())"
+      [disabled]="!resume()"
       (click)="startInterview()"
     >
       <span class="btn-text">Begin Interview</span>
