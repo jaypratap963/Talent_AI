@@ -55,9 +55,13 @@ export class RealtimeService {
   // sessionReady$ — fires when OpenAI session is configured
   sessionReady$ = new Subject<void>();
 
+  interviewComplete$ = new Subject<void>(); // fires when OpenAI signals interview complete (optional)
+
   // ── Private ───────────────────────────────────────────────────
   private ws: WebSocket | null = null;
-  private backendUrl = "ws://localhost:3001";
+  private backendUrl = window.location.hostname === 'localhost'
+  ? 'ws://localhost:3001'
+  : 'wss://your-app.railway.app';  // replace with your Railway URL
 
   // Mic / audio input
   private audioCtx: AudioContext | null = null;
@@ -220,11 +224,15 @@ export class RealtimeService {
         break;
 
       // ── Alex's full text response complete ──────────────────
-      case "response_text_done":
-        this.currentResponseText = msg.text || this.currentResponseText;
-        this.alexText.set(this.currentResponseText);
-        this.responseText$.next(this.currentResponseText);
-        break;
+      case 'response_text_done':
+  this.currentResponseText = msg.text || this.currentResponseText;
+  this.alexText.set(this.currentResponseText);
+  this.responseText$.next(this.currentResponseText);
+  // If Alex signalled interview complete, emit a separate event
+  if (msg.interviewDone) {
+    this.interviewComplete$.next();
+  }
+  break;
 
       // ── Alex's audio chunk (PCM16 base64) ──────────────────
       // This fires ~30 times per second while Alex speaks

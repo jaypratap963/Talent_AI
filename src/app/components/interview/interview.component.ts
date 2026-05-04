@@ -1,88 +1,103 @@
 import {
-  Component, OnInit, OnDestroy, inject, signal, computed
-} from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { FormsModule } from '@angular/forms';
-import { Subscription } from 'rxjs';
+  Component,
+  OnInit,
+  OnDestroy,
+  inject,
+  signal,
+  computed,
+} from "@angular/core";
+import { CommonModule } from "@angular/common";
+import { FormsModule } from "@angular/forms";
+import { Subscription } from "rxjs";
 
-import { InterviewService } from '../../services/interview.service';
-import { RealtimeService } from '../../services/realtime.service';
-import { SpeechService } from '../../services/speech.service';
-import { AiService } from '../../services/ai.service';
-import { ChatWindowComponent } from '../chat-window/chat-window.component';
+import { InterviewService } from "../../services/interview.service";
+import { RealtimeService } from "../../services/realtime.service";
+import { SpeechService } from "../../services/speech.service";
+import { AiService } from "../../services/ai.service";
+import { ChatWindowComponent } from "../chat-window/chat-window.component";
 
 @Component({
-  selector: 'app-interview',
+  selector: "app-interview",
   standalone: true,
   imports: [CommonModule, FormsModule, ChatWindowComponent],
-  templateUrl: './interview.component.html',
-  styleUrls: ['./interview.component.scss'],
+  templateUrl: "./interview.component.html",
+  styleUrls: ["./interview.component.scss"],
 })
 export class InterviewComponent implements OnInit, OnDestroy {
-
   interview = inject(InterviewService);
-  realtime  = inject(RealtimeService);
-  speech    = inject(SpeechService);
-  ai        = inject(AiService);
+  realtime = inject(RealtimeService);
+  speech = inject(SpeechService);
+  ai = inject(AiService);
 
   // ── UI state ──────────────────────────────────
-  textInput      = signal('');
-  demoMode       = signal(false);
+  textInput = signal("");
+  demoMode = signal(false);
   showEvaluation = signal(false);
-  isStarted      = signal(false);
-  showTextInput  = signal(false);
-  isConnecting   = signal(false);
+  isStarted = signal(false);
+  showTextInput = signal(false);
+  isConnecting = signal(false);
 
   // ── Derived from interview service ────────────
-  messages      = computed(() => this.interview.chatHistory());
-  isActive      = computed(() => this.interview.isActive());
-  isCompleted   = computed(() => this.interview.isCompleted());
-  isLoading     = computed(() => this.ai.isLoading());
-  isTyping      = computed(() => this.interview.isTyping());
-  evaluation    = computed(() => this.interview.session().evaluation);
-  questionNum   = computed(() => this.interview.questionCount());
-  currentQ      = computed(() => this.interview.session().currentQuestion);
+  messages = computed(() => this.interview.chatHistory());
+  isActive = computed(() => this.interview.isActive());
+  isCompleted = computed(() => this.interview.isCompleted());
+  isLoading = computed(() => this.ai.isLoading());
+  isTyping = computed(() => this.interview.isTyping());
+  evaluation = computed(() => this.interview.session().evaluation);
+  questionNum = computed(() => this.interview.questionCount());
+  currentQ = computed(() => this.interview.session().currentQuestion);
 
   // ── Derived from realtime service ─────────────
-  phase          = computed(() => this.realtime.phase());
-  isSpeaking     = computed(() => this.realtime.isSpeaking());
+  phase = computed(() => this.realtime.phase());
+  isSpeaking = computed(() => this.realtime.isSpeaking());
   // isListening = mic is active (replaces old speech.isListening signal)
-  isListening    = computed(() => this.realtime.isMicActive());
+  isListening = computed(() => this.realtime.isMicActive());
   // liveText = what VAD is showing / user transcript
-  liveText       = computed(() => this.realtime.userTranscript());
+  liveText = computed(() => this.realtime.userTranscript());
   // sttSupported = mic API available
-  readonly sttSupported = !!(navigator.mediaDevices?.getUserMedia);
+  readonly sttSupported = !!navigator.mediaDevices?.getUserMedia;
 
   // ── Avatar status label ───────────────────────
   statusLabel = computed<string>(() => {
-    if (!this.isStarted()) return '';
-    if (this.isConnecting()) return 'Connecting to Alex...';
+    if (!this.isStarted()) return "";
+    if (this.isConnecting()) return "Connecting to Alex...";
     switch (this.phase()) {
-      case 'connecting':    return 'Setting up interview...';
-      case 'ready':         return 'Your turn to speak';
-      case 'user-speaking': return "I'm listening...";
-      case 'user-done':     return 'Processing...';
-      case 'processing':    return 'Alex is thinking...';
-      case 'alex-speaking': return 'Alex is speaking...';
-      case 'error':         return this.realtime.error() || 'Connection error';
-      default:              return this.isActive() ? 'Your turn to speak' : '';
+      case "connecting":
+        return "Setting up interview...";
+      case "ready":
+        return "Your turn to speak";
+      case "user-speaking":
+        return "I'm listening...";
+      case "user-done":
+        return "Processing...";
+      case "processing":
+        return "Alex is thinking...";
+      case "alex-speaking":
+        return "Alex is speaking...";
+      case "error":
+        return this.realtime.error() || "Connection error";
+      default:
+        return this.isActive() ? "Your turn to speak" : "";
     }
   });
 
   // ── Avatar animation class ────────────────────
   avatarState = computed<string>(() => {
-    if (this.isConnecting() || this.phase() === 'connecting') return 'thinking';
+    if (this.isConnecting() || this.phase() === "connecting") return "thinking";
     switch (this.phase()) {
-      case 'user-speaking': return 'listening';
-      case 'user-done':
-      case 'processing':    return 'thinking';
-      case 'alex-speaking': return 'speaking';
+      case "user-speaking":
+        return "listening";
+      case "user-done":
+      case "processing":
+        return "thinking";
+      case "alex-speaking":
+        return "speaking";
       default:
         // Demo / non-realtime fallback
-        if (this.isTyping() || this.isLoading()) return 'thinking';
-        if (this.speech.isSpeaking()) return 'speaking';
-        if (this.speech.phase() === 'user-speaking') return 'listening';
-        return 'idle';
+        if (this.isTyping() || this.isLoading()) return "thinking";
+        if (this.speech.isSpeaking()) return "speaking";
+        if (this.speech.phase() === "user-speaking") return "listening";
+        return "idle";
     }
   });
 
@@ -94,33 +109,34 @@ export class InterviewComponent implements OnInit, OnDestroy {
     // ── Realtime mode subscriptions ───────────────
     // 1. User transcript → store in chat history
     this.subs.add(
-      this.realtime.userTranscript$.subscribe(transcript => {
+      this.realtime.userTranscript$.subscribe((transcript) => {
         this.interview.addUserMessage(transcript);
-
-        // Check if 8 questions answered → end interview
-        if (this.interview.questionCount() >= 8) {
-          this.endEarly();
-        }
-      })
+      }),
     );
 
     // 2. Alex's response text → store in chat history
     this.subs.add(
-      this.realtime.responseText$.subscribe(text => {
+      this.realtime.responseText$.subscribe((text) => {
         this.interview.addAlexMessage(text);
-        // Update question count in backend prompt
         this.realtime.updateQuestionCount(this.interview.questionCount());
-      })
+      }),
+    );
+
+    // Natural interview end — triggered by Alex's INTERVIEW_COMPLETE signal
+    this.subs.add(
+      this.realtime.interviewComplete$.subscribe(() => {
+        this.endInterview();
+      }),
     );
 
     // ── Demo / non-realtime mode subscription ─────
     // 3. Old-style STT transcript (demo mode only)
     this.subs.add(
-      this.speech.transcriptComplete$.subscribe(text => {
+      this.speech.transcriptComplete$.subscribe((text) => {
         if (!this.demoMode()) return; // Only handle in demo mode
         this.textInput.set(text);
         this.submitAnswer();
-      })
+      }),
     );
   }
 
@@ -145,9 +161,9 @@ export class InterviewComponent implements OnInit, OnDestroy {
     // Realtime mode
     this.isConnecting.set(true);
     try {
-      const resume     = this.interview.session().resumeData;
-      const resumeText = resume?.rawText  ?? '';
-      const skills     = resume?.skills?.join(', ') ?? '';
+      const resume = this.interview.session().resumeData;
+      const resumeText = resume?.rawText ?? "";
+      const skills = resume?.skills?.join(", ") ?? "";
 
       await this.realtime.connect(resumeText, skills);
       await this.realtime.startMic();
@@ -155,7 +171,7 @@ export class InterviewComponent implements OnInit, OnDestroy {
       this.isConnecting.set(false);
     } catch (err: any) {
       this.isConnecting.set(false);
-      this.realtime.error.set(err.message || 'Failed to connect to backend');
+      this.realtime.error.set(err.message || "Failed to connect to backend");
     }
   }
 
@@ -163,7 +179,7 @@ export class InterviewComponent implements OnInit, OnDestroy {
   async submitAnswer(): Promise<void> {
     const text = this.textInput().trim();
     if (!text || this.isLoading() || this.isTyping()) return;
-    this.textInput.set('');
+    this.textInput.set("");
 
     if (this.demoMode()) {
       this.speech.stopSpeaking();
@@ -175,7 +191,7 @@ export class InterviewComponent implements OnInit, OnDestroy {
   }
 
   onKeyDown(event: KeyboardEvent): void {
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       this.submitAnswer();
     }
@@ -205,22 +221,35 @@ export class InterviewComponent implements OnInit, OnDestroy {
   }
 
   toggleTextInput(): void {
-    this.showTextInput.update(v => !v);
+    this.showTextInput.update((v) => !v);
   }
 
+  // Called when user manually clicks "End Session"
   async endEarly(): Promise<void> {
-    if (!this.demoMode()) {
-      this.realtime.stopMic();
-    } else {
-      this.speech.stopListening();
-    }
-    await this.interview.endInterview(this.demoMode());
-    // Speak closing via regular TTS
-    this.speech.speak("That wraps up our interview. Thank you for your time. Let me prepare your evaluation.");
+    this.realtime.stopMic();
+    this.realtime.disconnect();
+    await this.interview.endInterview(false);
+    // No speech.speak() here — Alex already said goodbye via OpenAI audio,
+    // OR user ended manually and we don't need a second voice on top.
   }
 
-  viewEvaluation():  void { this.showEvaluation.set(true); }
-  hideEvaluation():  void { this.showEvaluation.set(false); }
+  // Called automatically when Alex detects natural interview end
+  async endInterview(): Promise<void> {
+    // Wait for Alex's closing audio to finish playing before stopping mic
+    // The mic is already suspended during Alex's speech, so just stop it after
+    setTimeout(() => {
+      this.realtime.stopMic();
+    }, 500);
+    await this.interview.endInterview(false);
+    // Do NOT call speech.speak() — Alex already said the goodbye via OpenAI voice
+  }
+
+  viewEvaluation(): void {
+    this.showEvaluation.set(true);
+  }
+  hideEvaluation(): void {
+    this.showEvaluation.set(false);
+  }
 
   restartInterview(): void {
     this.realtime.disconnect();
@@ -230,9 +259,19 @@ export class InterviewComponent implements OnInit, OnDestroy {
     this.isStarted.set(false);
     this.isConnecting.set(false);
     this.showEvaluation.set(false);
-    this.textInput.set('');
+    this.textInput.set("");
   }
 
-  getScoreClass(s: number) { return s >= 80 ? 'score-high' : s >= 60 ? 'score-mid' : 'score-low'; }
-  getScoreLabel(s: number) { return s >= 85 ? 'Excellent' : s >= 70 ? 'Good' : s >= 55 ? 'Fair' : 'Needs Work'; }
+  getScoreClass(s: number) {
+    return s >= 80 ? "score-high" : s >= 60 ? "score-mid" : "score-low";
+  }
+  getScoreLabel(s: number) {
+    return s >= 85
+      ? "Excellent"
+      : s >= 70
+        ? "Good"
+        : s >= 55
+          ? "Fair"
+          : "Needs Work";
+  }
 }
