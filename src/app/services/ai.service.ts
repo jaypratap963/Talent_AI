@@ -15,7 +15,7 @@
 //      └─ audio queue plays sentence 1 as soon as it arrives,
 //         sentences 2,3,4... play in sequence right after
 //
-//  NET RESULT: User hears Alex respond within ~1s of Whisper finishing.
+//  NET RESULT: User hears Madeline respond within ~1s of Whisper finishing.
 //  The filler clip covers the GPT latency. TTS of sentence 1 is ready
 //  ~300ms after GPT emits the first sentence.
 // ─────────────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ export class AiService {
   // PRE-WARM FILLER CLIPS
   // Generates 4 short "thinking" TTS clips and caches them as
   // Audio objects. When GPT is generating, we immediately play
-  // one of these so the user hears Alex react within ~100ms.
+  // one of these so the user hears Madeline react within ~100ms.
   // ─────────────────────────────────────────────────────────────
 
   private async preWarmFillerClips(): Promise<void> {
@@ -136,7 +136,7 @@ export class AiService {
     this.onQueueEmpty = onEnd ?? null;
 
     // ── Step 1: Play filler immediately ──────────────────────
-    // This fires ~0ms after Whisper returns — user hears Alex
+    // This fires ~0ms after Whisper returns — user hears Madeline
     // react before GPT has even started processing
     this.playFillerClip();
 
@@ -393,7 +393,7 @@ export class AiService {
     this.onQueueEmpty = null;
 
     // NEW: reset SpeechService state when audio is force-stopped
-    // (e.g. user taps "Mute Alex" mid-sentence)
+    // (e.g. user taps "Mute Madeline" mid-sentence)
     this.speechService.isSpeaking.set(false);
     this.speechService.muteVAD(false); // re-arm VAD
   }
@@ -416,7 +416,7 @@ export class AiService {
       }
     }
 
-    return `You are Alex, a sharp Senior Technical Interviewer at a top tech company.
+    return `You are Madeline, a sharp Senior Technical Interviewer at a top tech company.
 
 PERSONALITY:
 - Professional, warm, human — not robotic
@@ -523,7 +523,7 @@ Respond only with the question or follow-up. No meta-commentary.`;
 
   getDemoResponse(questionCount: number): string {
     const q = [
-      "Hi! I'm Alex. To start, could you walk me through your background and what brings you to this role?",
+      "Hi! I'm Madeline. To start, could you walk me through your background and what brings you to this role?",
       "Solid overview. Tell me about a technically challenging project you've worked on. What was your specific contribution?",
       "How did you approach debugging that? What tools or strategies did you use?",
       "Let's talk about teamwork. Describe a time you disagreed with a technical decision. How did you handle it?",
